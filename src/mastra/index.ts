@@ -1,21 +1,13 @@
 import {Mastra} from '@mastra/core/mastra';
 import {registerApiRoute} from '@mastra/core/server';
 import {MASTRA_RESOURCE_ID_KEY} from '@mastra/core/request-context';
-import {LibSQLStore} from '@mastra/libsql';
 import {MastraAuthKinde} from '@kinde-oss/mastra-auth-kinde';
 
 import {getKindeUser, getOrgCode, getPermissions, resourceIdForUser, PERMISSIONS} from './lib/kinde';
 import {tripAgent} from './agents/trip-agent';
+import {storage} from './storage';
 
-/**
- * One LibSQL database backs both Mastra memory and (later) saved itineraries.
- * Keeping it to a single file is deliberate: `git clone && npm run dev` should
- * not require provisioning a database.
- */
-export const storage = new LibSQLStore({
-  id: 'mastra-starter-kit',
-  url: process.env.DATABASE_URL ?? 'file:./mastra.db'
-});
+export {storage};
 
 /**
  * Kinde authentication for every Mastra server route.

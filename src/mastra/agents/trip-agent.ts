@@ -4,6 +4,7 @@ import type {MastraModelConfig} from '@mastra/core/llm';
 import {ItinerarySchema} from '../schemas/itinerary';
 import {getWeatherTool} from '../tools/get-weather';
 import {findActivitiesTool} from '../tools/find-activities';
+import {tripMemory} from '../memory';
 
 /**
  * The model the starter kit uses.
@@ -32,6 +33,12 @@ Rules for the plan:
 - Build a day that flows. Activities should make sense in sequence and in location, not read as a list of unrelated suggestions.
 - Order activities chronologically, numbering them from 1, and give each a start time.
 - Use the notes for practical advice and for any weather trade-off worth flagging.
+
+Remembering the traveller:
+- You have working memory holding their standing travel preferences. Apply it silently — if they are vegetarian, pick food stops accordingly; if they dislike museums, do not offer one.
+- When they state a lasting preference ("I'm vegetarian", "I don't like museums", "I prefer late mornings"), record it in working memory so later conversations benefit.
+- Only record trip-planning preferences that fit the schema. Never record anything else they mention about themselves.
+- A one-off detail about this specific trip is not a standing preference — leave it out.
 
 Be concise. The plan matters, not the commentary.`;
 
@@ -63,6 +70,9 @@ export function createTripAgent(options: {model?: MastraModelConfig} = {}) {
       'get-weather': getWeatherTool,
       'find-activities': findActivitiesTool
     },
+    // Conversation history plus resource-scoped travel preferences. The
+    // resource id comes from the verified Kinde token, never from the client.
+    memory: tripMemory,
     defaultOptions: {
       structuredOutput: {
         schema: ItinerarySchema,
