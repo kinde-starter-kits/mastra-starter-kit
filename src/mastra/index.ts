@@ -5,6 +5,7 @@ import {LibSQLStore} from '@mastra/libsql';
 import {MastraAuthKinde} from '@kinde-oss/mastra-auth-kinde';
 
 import {getKindeUser, getOrgCode, getPermissions, resourceIdForUser, PERMISSIONS} from './lib/kinde';
+import {tripAgent} from './agents/trip-agent';
 
 /**
  * One LibSQL database backs both Mastra memory and (later) saved itineraries.
@@ -112,7 +113,7 @@ function buildClaimWarnings(orgCode: unknown, permissions: unknown): string[] {
 
 export const mastra = new Mastra({
   storage,
-  agents: {},
+  agents: {tripAgent},
   workflows: {},
   server: {
     auth,
