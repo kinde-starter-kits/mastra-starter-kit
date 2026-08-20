@@ -23,3 +23,12 @@ coverage/
 
 # ---------------------------------------------------------------------
 # Add specific rules here…
+.env
+.env.local
+
+# Mastra build output and local LibSQL database
+.mastra/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
