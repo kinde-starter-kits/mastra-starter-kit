@@ -1,143 +1,227 @@
-import {useCallback, useEffect, useState} from 'react';
+import {useCallback, useEffect, useRef, useState} from 'react';
 import {useKindeAuth} from '@kinde-oss/kinde-auth-react';
 
-import {fetchIdentity, type Identity} from './lib/mastra-client';
+import {
+  MastraRequestError,
+  fetchIdentity,
+  runPlanTrip,
+  type AgentResponse,
+  type Identity
+} from './lib/mastra-client';
+import {newThreadId} from './lib/thread';
+import {ItineraryCard} from './components/ItineraryCard';
+import {SavedList} from './components/SavedList';
+import {MessageCard} from './components/MessageCard';
+
+const EXAMPLE = "Plan me an afternoon in Lagos tomorrow. I like outdoor activities and don't want anything too early.";
+
+type Turn = {id: string; request: string; response: AgentResponse};
 
 export function App() {
   const {isLoading, isAuthenticated, user, login, logout, getAccessToken} = useKindeAuth();
 
   const [identity, setIdentity] = useState<Identity | null>(null);
+  const [request, setRequest] = useState(EXAMPLE);
+  const [turns, setTurns] = useState<Turn[]>([]);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [checking, setChecking] = useState(false);
 
-  const loadIdentity = useCallback(async () => {
-    setChecking(true);
-    setError(null);
-    try {
-      const token = await getAccessToken();
-      setIdentity(await fetchIdentity(token));
-    } catch (err) {
-      setIdentity(null);
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setChecking(false);
-    }
-  }, [getAccessToken]);
+  // One thread for the whole conversation, so Memory can follow it.
+  const threadId = useRef<string>(newThreadId());
 
   useEffect(() => {
-    if (isAuthenticated) void loadIdentity();
-  }, [isAuthenticated, loadIdentity]);
+    if (!isAuthenticated) return;
+    void (async () => {
+      try {
+        setIdentity(await fetchIdentity(await getAccessToken()));
+      } catch (err) {
+        console.error('[app] could not load identity', err);
+      }
+    })();
+  }, [isAuthenticated, getAccessToken]);
+
+  const send = useCallback(
+    async (message: string) => {
+      const trimmed = message.trim();
+      if (!trimmed || busy) return;
+
+      setBusy(true);
+      setError(null);
+
+      try {
+        const token = await getAccessToken();
+        const response = await runPlanTrip(token, {message: trimmed, threadId: threadId.current});
+        setTurns(previous => [...previous, {id: `${Date.now()}`, request: trimmed, response}]);
+      } catch (err) {
+        setError(
+          err instanceof MastraRequestError ? err.message : 'Something went wrong. Please try again.'
+        );
+      } finally {
+        setBusy(false);
+      }
+    },
+    [busy, getAccessToken]
+  );
+
+  const startNewConversation = useCallback(() => {
+    threadId.current = newThreadId();
+    setTurns([]);
+    setError(null);
+    setRequest(EXAMPLE);
+  }, []);
 
   if (isLoading) {
     return (
       <main className="shell">
-        <p className="muted">Loading…</p>
+        <p className="muted" role="status">
+          Loading…
+        </p>
+      </main>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <main className="shell">
+        <section className="card hero">
+          <p className="eyebrow">Mastra × Kinde</p>
+          <h1>Plan My Day</h1>
+          <p className="lede">
+            An AI day planner that knows who you are, which organization you belong to, and what
+            you&apos;re allowed to do.
+          </p>
+          <button className="btn" onClick={() => void login()}>
+            Sign in with Kinde
+          </button>
+          <p className="muted small">
+            You&apos;ll be sent to Kinde. The access token that comes back is what the Mastra
+            server verifies on every request.
+          </p>
+        </section>
       </main>
     );
   }
 
   return (
     <main className="shell">
-      <header className="header">
-        <div>
-          <h1>Plan My Day</h1>
-          <p className="muted">Mastra agents, authenticated and scoped by Kinde.</p>
+      <header className="topbar">
+        <div className="brand">
+          <span className="dot" aria-hidden="true" />
+          <strong>Plan My Day</strong>
         </div>
-        {isAuthenticated ? (
-          <button className="btn ghost" onClick={() => void logout()}>
+        <div className="who">
+          <span className="email">{user?.email ?? identity?.sub ?? 'Signed in'}</span>
+          {identity?.orgCode ? <span className="org">{identity.orgCode}</span> : null}
+          <button className="btn ghost small" onClick={() => void logout()}>
             Sign out
           </button>
-        ) : null}
+        </div>
       </header>
 
-      {!isAuthenticated ? (
-        <section className="card center">
-          <h2>Sign in to get started</h2>
-          <p className="muted">
-            You&apos;ll be sent to Kinde. The access token that comes back is what the Mastra
-            server verifies on every request.
-          </p>
-          <button className="btn" onClick={() => void login()}>
-            Sign in with Kinde
-          </button>
+      {identity?.claimWarnings.length ? (
+        <section className="card warn" role="status">
+          <h2>Kinde setup incomplete</h2>
+          <ul>
+            {identity.claimWarnings.map(warning => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
         </section>
-      ) : (
-        <>
-          <section className="card">
-            <h2>Signed in</h2>
-            <dl className="facts">
-              <dt>Email</dt>
-              <dd>{user?.email ?? '—'}</dd>
-              <dt>Kinde user ID</dt>
-              <dd>
-                <code>{identity?.sub ?? '—'}</code>
-              </dd>
-              <dt>Organization</dt>
-              <dd>{identity?.orgCode ? <code>{identity.orgCode}</code> : <em>none</em>}</dd>
-              <dt>Memory resource ID</dt>
-              <dd>
-                {identity?.resourceId ? <code>{identity.resourceId}</code> : <em>not derived</em>}
-                <span className="hint">derived server-side from the token</span>
-              </dd>
-            </dl>
-          </section>
+      ) : null}
 
-          <section className="card">
-            <h2>Permissions</h2>
-            {identity && identity.permissions.length > 0 ? (
-              <ul className="chips">
-                {identity.permissions.map(permission => (
-                  <li key={permission} className="chip">
-                    {permission}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="muted">No permissions on this token.</p>
-            )}
+      <section className="card composer">
+        <h1>What&apos;s the plan?</h1>
+        <p className="muted">
+          Describe the day you want. The agent checks the weather, finds activities, and builds an
+          itinerary. Ask it to <em>save this itinerary</em> once you like it.
+        </p>
 
-            <ul className="checks">
-              <Check ok={!!identity?.can.readItinerary} label="read:itinerary — view saved itineraries" />
-              <Check ok={!!identity?.can.createItinerary} label="create:itinerary — save an itinerary" />
-            </ul>
-          </section>
+        <form
+          onSubmit={event => {
+            event.preventDefault();
+            void send(request);
+          }}
+        >
+          <label className="sr-only" htmlFor="request">
+            Your request
+          </label>
+          <textarea
+            id="request"
+            rows={3}
+            value={request}
+            disabled={busy}
+            onChange={event => setRequest(event.target.value)}
+            placeholder={EXAMPLE}
+          />
 
-          {identity?.claimWarnings.length ? (
-            <section className="card warn">
-              <h2>Kinde setup incomplete</h2>
-              <ul>
-                {identity.claimWarnings.map(warning => (
-                  <li key={warning}>{warning}</li>
-                ))}
-              </ul>
-            </section>
-          ) : null}
+          <div className="actions">
+            <button className="btn" type="submit" disabled={busy || request.trim().length === 0}>
+              {busy ? 'Planning…' : 'Plan my day'}
+            </button>
+            {turns.length > 0 ? (
+              <button className="btn ghost" type="button" onClick={startNewConversation}>
+                New conversation
+              </button>
+            ) : null}
+          </div>
+        </form>
 
-          {error ? (
-            <section className="card error">
-              <h2>Could not reach Mastra</h2>
-              <p>{error}</p>
-            </section>
-          ) : null}
-
-          <button className="btn ghost" onClick={() => void loadIdentity()} disabled={checking}>
-            {checking ? 'Checking…' : 'Re-check identity'}
-          </button>
-
-          <p className="muted next">
-            Next: the planning agent, its tools, and saved itineraries.
+        {identity ? (
+          <p className="perms">
+            <PermissionPill ok={identity.can.readItinerary} label="read:itinerary" />
+            <PermissionPill ok={identity.can.createItinerary} label="create:itinerary" />
           </p>
-        </>
-      )}
+        ) : null}
+      </section>
+
+      {error ? (
+        <section className="card error" role="alert">
+          <h2>That didn&apos;t work</h2>
+          <p>{error}</p>
+        </section>
+      ) : null}
+
+      {busy ? (
+        <section className="card loading" role="status" aria-live="polite">
+          <span className="spinner" aria-hidden="true" />
+          <span>Checking the weather and finding activities…</span>
+        </section>
+      ) : null}
+
+      {turns.length === 0 && !busy && !error ? (
+        <section className="card empty">
+          <h2>Nothing planned yet</h2>
+          <p className="muted">Send a request above to get started.</p>
+        </section>
+      ) : null}
+
+      {[...turns].reverse().map(turn => (
+        <section key={turn.id} className="turn">
+          <p className="asked">“{turn.request}”</p>
+          <ResponseView response={turn.response} />
+        </section>
+      ))}
     </main>
   );
 }
 
-function Check({ok, label}: {ok: boolean; label: string}) {
+function ResponseView({response}: {response: AgentResponse}) {
+  switch (response.kind) {
+    case 'itinerary':
+      return <ItineraryCard itinerary={response.itinerary} />;
+    case 'saved-list':
+      return <SavedList itineraries={response.itineraries} />;
+    case 'message':
+      return <MessageCard message={response.message} />;
+    default:
+      return null;
+  }
+}
+
+function PermissionPill({ok, label}: {ok: boolean; label: string}) {
   return (
-    <li className={ok ? 'check yes' : 'check no'}>
-      <span aria-hidden="true">{ok ? '✓' : '✕'}</span>
-      {label}
-    </li>
+    <span className={ok ? 'pill yes' : 'pill no'}>
+      <span aria-hidden="true">{ok ? '✓' : '✕'}</span> {label}
+    </span>
   );
 }
