@@ -23,6 +23,22 @@ export type WeatherCondition = (typeof WEATHER_CONDITIONS)[number];
 export const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
 export type Weekday = (typeof WEEKDAYS)[number];
 
+/**
+ * How strongly the weather should override a stated preference.
+ *
+ * `moderate` demotes weather-sensitive activities but leaves preferences able
+ * to outweigh them. `severe` is the point where going ahead outdoors stops
+ * being a preference and becomes a bad plan, so weather-compatible activities
+ * rank first regardless of how many preference tags an alternative matches.
+ */
+export const WEATHER_SEVERITIES = ['none', 'moderate', 'severe'] as const;
+export type WeatherSeverity = (typeof WEATHER_SEVERITIES)[number];
+
+/** At or above this chance of rain, an outdoor plan needs a compatible option. */
+export const SEVERE_PRECIPITATION_CHANCE = 70;
+export const SEVERE_HIGH_CELSIUS = 38;
+export const SEVERE_LOW_CELSIUS = 0;
+
 /** Thresholds that turn a forecast into a bucket. Tuned once, applied everywhere. */
 const WET_PRECIPITATION_CHANCE = 50;
 const HOT_CELSIUS = 32;
@@ -475,6 +491,11 @@ export const FindActivitiesOutputSchema = z
     condition: z
       .enum([...WEATHER_CONDITIONS, 'unknown'])
       .describe('The weather bucket derived from the supplied forecast, if any.'),
+    weatherSeverity: z
+      .enum(WEATHER_SEVERITIES)
+      .describe(
+        'How strongly the weather should shape the plan. When "severe", weather-compatible activities are ranked first and an all-outdoor plan is not appropriate.'
+      ),
     totalMatches: z
       .int()
       .min(0)
@@ -535,6 +556,34 @@ export function deriveCondition(
   return 'mild';
 }
 
+/**
+ * How severe the supplied forecast is. Returns 'none' when no weather context
+ * was given, so an absent forecast never silently suppresses preferences.
+ */
+export function deriveSeverity(
+  weather: z.infer<typeof WeatherContextSchema> | undefined
+): WeatherSeverity {
+  if (!weather) return 'none';
+  const {precipitationChance, highCelsius} = weather;
+
+  if (
+    (precipitationChance !== undefined && precipitationChance >= SEVERE_PRECIPITATION_CHANCE) ||
+    (highCelsius !== undefined && highCelsius >= SEVERE_HIGH_CELSIUS) ||
+    (highCelsius !== undefined && highCelsius <= SEVERE_LOW_CELSIUS)
+  ) {
+    return 'severe';
+  }
+
+  if (
+    (precipitationChance !== undefined && precipitationChance >= WET_PRECIPITATION_CHANCE) ||
+    (highCelsius !== undefined && (highCelsius >= HOT_CELSIUS || highCelsius <= COLD_CELSIUS))
+  ) {
+    return 'moderate';
+  }
+
+  return 'none';
+}
+
 /** Map an ISO date to a weekday key, in UTC so the result never shifts with the host timezone. */
 export function weekdayFor(date: string): Weekday {
   const day = new Date(`${date}T00:00:00Z`).getUTCDay();
@@ -552,13 +601,38 @@ export function weekdayFor(date: string): Weekday {
  * returns options and the agent decides. `weatherFit` on each result makes the
  * reason visible.
  */
+/**
+ * Match a requested preference against an activity tag.
+ *
+ * Tags are hyphenated compounds, so an exact comparison misses the cases that
+ * matter: a traveller says "vegetarian" and the tag is "vegetarian-options".
+ * Whole hyphen-separated segments are compared, which catches that without the
+ * false positives a substring match would produce ("art" inside "party").
+ */
+export function tagMatches(requested: string, activityTag: string): boolean {
+  const want = normalize(requested).replace(/\s+/g, '-');
+  const have = normalize(activityTag).replace(/\s+/g, '-');
+  if (want === have) return true;
+
+  // Match only on hyphen boundaries, so "vegetarian" matches
+  // "vegetarian-options" and "step-free" matches "step-free-access", while
+  // "art" still does not match "party".
+  return (
+    have.startsWith(`${want}-`) ||
+    have.endsWith(`-${want}`) ||
+    want.startsWith(`${have}-`) ||
+    want.endsWith(`-${have}`)
+  );
+}
+
 export function scoreActivity(
   activity: SeededActivity,
   condition: WeatherCondition | 'unknown',
   requestedTags: string[]
 ): {score: number; matchedTags: string[]; weatherFit: 'good' | 'poor' | 'unknown'} {
-  const activityTags = new Set(activity.tags.map(normalize));
-  const matchedTags = requestedTags.filter(tag => activityTags.has(normalize(tag)));
+  const matchedTags = requestedTags.filter(tag =>
+    activity.tags.some(activityTag => tagMatches(tag, activityTag))
+  );
 
   let score = matchedTags.length * 3;
   let weatherFit: 'good' | 'poor' | 'unknown' = 'unknown';
@@ -599,9 +673,27 @@ export function findActivities(input: FindActivitiesInput): FindActivitiesOutput
     return true;
   });
 
+  const severity = deriveSeverity(weather);
+
   const ranked = matches
     .map(activity => ({activity, ...scoreActivity(activity, condition, tags)}))
     .sort((a, b) => {
+      /*
+       * Preference hierarchy. Hard filters (location, category, opening day)
+       * have already been applied above. What remains is the ordering between
+       * weather safety and stated preference.
+       *
+       * In severe weather, weather compatibility is a primary key: no number
+       * of matched preference tags can lift a weather-incompatible activity
+       * above a compatible one. Below that threshold the score decides, so a
+       * preference still outweighs a mild forecast.
+       */
+      if (severity === 'severe') {
+        const aFit = a.weatherFit === 'poor' ? 1 : 0;
+        const bFit = b.weatherFit === 'poor' ? 1 : 0;
+        if (aFit !== bFit) return aFit - bFit;
+      }
+
       // Deterministic ordering: score, then name, then id. Name before id keeps
       // the output predictable to a human reading it; id guarantees totality.
       if (b.score !== a.score) return b.score - a.score;
@@ -613,6 +705,7 @@ export function findActivities(input: FindActivitiesInput): FindActivitiesOutput
   return {
     location,
     condition,
+    weatherSeverity: severity,
     totalMatches: ranked.length,
     activities: ranked.slice(0, limit).map(({activity, matchedTags, weatherFit}) => ({
       id: activity.id,

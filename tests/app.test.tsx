@@ -22,6 +22,8 @@ vi.mock('@kinde-oss/kinde-auth-react', () => ({
 
 const runPlanTrip = vi.fn();
 const fetchIdentity = vi.fn();
+const fetchConversations = vi.fn();
+const fetchConversation = vi.fn();
 
 vi.mock('../src/app/lib/mastra-client', async () => {
   const actual = await vi.importActual<typeof import('../src/app/lib/mastra-client')>(
@@ -30,7 +32,9 @@ vi.mock('../src/app/lib/mastra-client', async () => {
   return {
     ...actual,
     runPlanTrip: (...args: unknown[]) => runPlanTrip(...args),
-    fetchIdentity: (...args: unknown[]) => fetchIdentity(...args)
+    fetchIdentity: (...args: unknown[]) => fetchIdentity(...args),
+    fetchConversations: (...args: unknown[]) => fetchConversations(...args),
+    fetchConversation: (...args: unknown[]) => fetchConversation(...args)
   };
 });
 
@@ -93,6 +97,13 @@ beforeEach(() => {
   auth.isAuthenticated = true;
   fetchIdentity.mockResolvedValue(IDENTITY);
   runPlanTrip.mockResolvedValue(itineraryResponse);
+  fetchConversations.mockResolvedValue({conversations: []});
+  fetchConversation.mockResolvedValue({
+    threadId: 'thread-1', title: 'Lagos Afternoon',
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    messages: []
+  });
+  localStorage.clear();
 });
 
 afterEach(cleanup);
@@ -336,6 +347,112 @@ describe('errors', () => {
   });
 });
 
+describe('conversation persistence wiring', () => {
+  const CONVERSATIONS = [
+    {threadId: 'thread-lagos', title: 'Lagos Afternoon', createdAt: '2026-08-20T10:00:00.000Z', updatedAt: '2026-08-21T10:00:00.000Z'},
+    {threadId: 'thread-lisbon', title: 'Lisbon Weekend', createdAt: '2026-08-19T10:00:00.000Z', updatedAt: '2026-08-20T10:00:00.000Z'}
+  ];
+
+  it('lists the conversations the server returned', async () => {
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Lagos Afternoon')).toBeDefined());
+    expect(screen.getByText('Lisbon Weekend')).toBeDefined();
+  });
+
+  it('shows an empty state when there are none', async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/no conversations yet/i)).toBeDefined());
+  });
+
+  it('loads the conversation the user clicks', async () => {
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[1], messages: []});
+
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Lisbon Weekend')).toBeDefined());
+
+    await user.click(screen.getByText('Lisbon Weekend'));
+    await waitFor(() => expect(fetchConversation).toHaveBeenCalled());
+
+    const [, requestedThread] = fetchConversation.mock.calls.at(-1) as [unknown, string];
+    expect(requestedThread).toBe('thread-lisbon');
+  });
+
+  it('restores the remembered thread on startup when it belongs to the user', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], messages: []});
+
+    render(<App />);
+    await waitFor(() => expect(fetchConversation).toHaveBeenCalled());
+    const [, requestedThread] = fetchConversation.mock.calls.at(-1) as [unknown, string];
+    expect(requestedThread).toBe('thread-lagos');
+  });
+
+  it('ignores a remembered thread that is not in the user list', async () => {
+    // A stale or foreign id must never select someone else's conversation.
+    localStorage.setItem('planmyday.activeThreadId', 'thread-belongs-to-someone-else');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Lagos Afternoon')).toBeDefined());
+
+    expect(fetchConversation).not.toHaveBeenCalled();
+    expect(localStorage.getItem('planmyday.activeThreadId')).toBeNull();
+  });
+
+  it('recovers without an error state when loading fails', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockRejectedValue(new Error('gone'));
+
+    render(<App />);
+    await waitFor(() => expect(fetchConversation).toHaveBeenCalled());
+
+    // No alert: a missing conversation just means "start a new plan".
+    expect(screen.queryByRole('alert')).toBeNull();
+    await waitFor(() => expect(localStorage.getItem('planmyday.activeThreadId')).toBeNull());
+  });
+
+  it('stores only the active thread id in localStorage, never contents', async () => {
+    render(<App />);
+    await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
+
+    await waitFor(() => expect(localStorage.getItem('planmyday.activeThreadId')).toBeTruthy());
+    expect(Object.keys(localStorage)).toEqual(['planmyday.activeThreadId']);
+    expect(JSON.stringify(localStorage)).not.toContain('Nike Art Gallery');
+  });
+
+  it('refreshes the conversation list after a completed turn', async () => {
+    render(<App />);
+    fetchConversations.mockClear();
+
+    await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(fetchConversations).toHaveBeenCalled());
+  });
+
+  it('new conversation clears the transcript and the remembered thread', async () => {
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    const user = userEvent.setup();
+
+    render(<App />);
+    await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(screen.getByText('Lagos')).toBeDefined());
+
+    const panelNew = screen.getByRole('button', {name: /\+ new conversation/i});
+    await user.click(panelNew);
+
+    await waitFor(() => expect(screen.getByText(/nothing planned yet/i)).toBeDefined());
+    expect(localStorage.getItem('planmyday.activeThreadId')).toBeNull();
+    // Existing conversations are untouched.
+    expect(screen.getByText('Lagos Afternoon')).toBeDefined();
+  });
+});
+
 describe('composer behaviour', () => {
   it('clears the box after a successful turn so the next request is easy', async () => {
     render(<App />);
@@ -491,7 +608,9 @@ describe('conversation threads', () => {
     const user = await plan('Plan me an afternoon in Lagos.');
     await waitFor(() => expect(runPlanTrip).toHaveBeenCalledTimes(1));
 
-    await user.click(screen.getByRole('button', {name: /new conversation/i}));
+    const composerNew = document.querySelector('.actions .btn.ghost') as HTMLButtonElement;
+    expect(composerNew).not.toBeNull();
+    await user.click(composerNew);
     await waitFor(() => expect(screen.getByText(/nothing planned yet/i)).toBeDefined());
 
     await plan('Plan me a morning in Lisbon.');

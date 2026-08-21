@@ -5,6 +5,12 @@ import {MastraAuthKinde} from '@kinde-oss/mastra-auth-kinde';
 
 import {getKindeUser, getOrgCode, getPermissions, resourceIdForUser, PERMISSIONS} from './lib/kinde';
 import {tripAgent} from './agents/trip-agent';
+import {tripMemory} from './memory';
+import {
+  ConversationAccessError,
+  listConversations,
+  loadConversation
+} from './lib/conversations';
 import {planTripWorkflow} from './workflows/plan-trip';
 import {storage} from './storage';
 import {
@@ -121,13 +127,65 @@ function buildClaimWarnings(orgCode: unknown, permissions: unknown): string[] {
   return warnings;
 }
 
+/**
+ * Conversation routes.
+ *
+ * Mastra reserves the `/api` prefix for its own routes and rejects a custom
+ * route that starts with it, so these live at `/conversations`. Both derive the
+ * resource id from the verified request context and never read an owner,
+ * subject, organization or resource id from the request.
+ */
+const conversationsRoute = registerApiRoute('/conversations', {
+  method: 'GET',
+  handler: async c => {
+    const requestContext = c.get('requestContext');
+    const user = getKindeUser(requestContext);
+    const resourceId = resourceIdForUser(user);
+
+    if (!user || !resourceId) {
+      return c.json({error: 'Unauthenticated'}, 401);
+    }
+
+    const conversations = await listConversations({memory: tripMemory, resourceId});
+    return c.json({conversations});
+  }
+});
+
+const conversationRoute = registerApiRoute('/conversations/:threadId', {
+  method: 'GET',
+  handler: async c => {
+    const requestContext = c.get('requestContext');
+    const user = getKindeUser(requestContext);
+    const resourceId = resourceIdForUser(user);
+
+    if (!user || !resourceId) {
+      return c.json({error: 'Unauthenticated'}, 401);
+    }
+
+    try {
+      const conversation = await loadConversation({
+        memory: tripMemory,
+        resourceId,
+        threadId: c.req.param('threadId')
+      });
+      return c.json(conversation);
+    } catch (error) {
+      if (error instanceof ConversationAccessError) {
+        // Same response whether it is missing or owned by someone else.
+        return c.json({error: 'Conversation not found.'}, 404);
+      }
+      throw error;
+    }
+  }
+});
+
 export const mastra = new Mastra({
   storage,
   agents: {tripAgent},
   workflows: {planTripWorkflow},
   server: {
     auth,
-    apiRoutes: [meRoute],
+    apiRoutes: [meRoute, conversationsRoute, conversationRoute],
     middleware: [
       {
         /*
@@ -150,7 +208,9 @@ export const mastra = new Mastra({
     // The SPA runs on a different origin in development.
     cors: {
       origin: (process.env.APP_ORIGIN ?? 'http://localhost:5173').split(','),
-      allowHeaders: ['Content-Type', 'Authorization'],
+      // OPENAI_KEY_HEADER must be listed, or the browser's preflight rejects
+      // every BYOK request before it is sent.
+      allowHeaders: ['Content-Type', 'Authorization', OPENAI_KEY_HEADER],
       allowMethods: ['GET', 'POST', 'OPTIONS'],
       credentials: false
     }

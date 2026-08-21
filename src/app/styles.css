@@ -287,3 +287,27 @@ code {
 @media (max-width: 560px) {
   .ai-panel { right: auto; left: 0; }
 }
+
+/* --- conversations (minimal wiring; full sidebar comes in Phase 5) ------- */
+
+.conversations-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 10px;
+}
+.conversations-head h2 { margin: 0; }
+
+.conversation-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+
+.conversation-item {
+  width: 100%; text-align: left; cursor: pointer;
+  background: transparent; border: 1px solid transparent; border-radius: 8px;
+  color: inherit; font: inherit; padding: 8px 10px;
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+}
+.conversation-item:hover { background: var(--raised); }
+.conversation-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.conversation-item.active { background: var(--raised); border-color: var(--border); }
+.conversation-item.active .conversation-title { color: var(--accent); }
+
+.conversation-title { font-size: 0.92rem; }
+.conversation-time { color: var(--muted); font-size: 0.75rem; flex: none; }

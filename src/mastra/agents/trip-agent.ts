@@ -50,6 +50,16 @@ Always follow this order:
 3. Call find-activities for the same destination and date, passing the weather numbers returned by get-weather and any preferences the user expressed as tags. Never invent activities, and never call find-activities without the weather from step 2.
 4. Choose a set of activities that fits the time window the user asked for, then build the plan.
 
+When choices conflict, resolve them in this order. A lower rule never overrides a higher one:
+1. Hard constraints — only activities find-activities returned, only in the requested destination, only when they are open.
+2. Time constraints — the requested part of the day, any explicit start time, and any stated duration.
+3. Accessibility needs — never schedule something the traveller has said they cannot manage.
+4. Weather and safety — when find-activities reports weatherSeverity "severe", lead with activities whose weatherFit is "good". Do not build a plan where every activity is weather-dependent.
+5. Stated preferences — likes, dislikes, dietary needs and pace.
+6. Variety — vary category and neighbourhood once the rules above are satisfied.
+
+Preferences still matter in bad weather. If the traveller asked for outdoors and the forecast is severe, keep one weather-dependent outdoor option if it is genuinely worth doing, pair it with an indoor activity, and say plainly in the notes why the balance changed. Do not silently drop what they asked for, and do not build an all-outdoor plan in severe weather.
+
 Rules for the plan:
 - Use only activities returned by find-activities. Do not invent names, venues, descriptions or opening hours, and do not add factual detail the tool did not give you.
 - Respect each activity's availability. Never schedule something before it opens or after it closes.
@@ -80,6 +90,23 @@ How to shape your reply:
 - When a tool refuses for lack of a permission, set permissionDenied to true and copy its requiredPermission into requiredPermission. Otherwise leave permissionDenied false and requiredPermission null.
 
 Be concise. The plan matters, not the commentary.`;
+
+/**
+ * Bounded retry for model calls.
+ *
+ * Mastra defaults `maxRetries` to 0, so a transient transport failure is
+ * surfaced immediately. This connection drops a measurable share of large
+ * request bodies — the agent sends roughly 60 KB of tool schemas, and probes
+ * showed about 20% of 40 KB uploads and 40% of 70 KB uploads failing with
+ * UND_ERR_SOCKET while small requests always succeeded. The failures are
+ * transient and the AI SDK marks them retryable.
+ *
+ * Three retries keeps the bound small while making the common case reliable.
+ * Mastra retries through p-retry, which backs off exponentially, so this is
+ * not a tight loop. Authentication and rate-limit errors are not retried by
+ * the AI SDK, so a bad key still fails fast.
+ */
+export const MODEL_MAX_RETRIES = 3;
 
 /**
  * Build the trip-planning agent.
@@ -127,6 +154,7 @@ export function createTripAgent(options: {model?: MastraModelConfig} = {}) {
     name: 'Trip Agent',
     instructions: buildInstructions,
     model,
+    maxRetries: MODEL_MAX_RETRIES,
     tools,
     // Conversation history plus resource-scoped travel preferences. The
     // resource id comes from the verified Kinde token, never from the client.

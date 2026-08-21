@@ -20,7 +20,7 @@ process.env.KINDE_DOMAIN = TEST_DOMAIN;
 process.env.KINDE_AUDIENCE = TEST_AUDIENCE;
 process.env.KINDE_ALLOWED_ORG_CODES = '';
 
-const {planTripWorkflow, PlanTripInputSchema} = await import(
+const {planTripWorkflow, PlanTripInputSchema, MAX_CORRECTION_ATTEMPTS} = await import(
   '../src/mastra/workflows/plan-trip.js'
 );
 const {createTripAgent} = await import('../src/mastra/agents/trip-agent.js');
@@ -163,6 +163,112 @@ describe('registration and input', () => {
   });
 });
 
+/** A plan that breaks the afternoon window, as the reported bug did. */
+const INVALID_ITINERARY = {
+  ...ITINERARY,
+  activities: [
+    {
+      order: 1, name: 'Ndubuisi Kanu Park morning run', category: 'outdoor',
+      startTime: '06:00', durationMinutes: 60, location: 'Lagos',
+      description: 'A looped tarmac path in Alausa.', weatherDependent: true
+    }
+  ]
+};
+
+/** A plan that satisfies the same request. */
+const VALID_ITINERARY = {
+  ...ITINERARY,
+  activities: [
+    {
+      order: 1, name: 'Nike Art Gallery', category: 'culture',
+      startTime: '14:00', durationMinutes: 90, location: 'Lekki, Lagos',
+      description: 'Five floors of Nigerian art.', weatherDependent: false
+    }
+  ]
+};
+
+const AFTERNOON_REQUEST =
+  "Plan me an afternoon in Lagos tomorrow. I like outdoor activities and don't want anything too early.";
+
+describe('itinerary validation in the workflow', () => {
+  it('makes exactly one correction attempt, never a loop', () => {
+    expect(MAX_CORRECTION_ATTEMPTS).toBe(1);
+  });
+
+  it('accepts a valid itinerary without correcting it', async () => {
+    const context = await contextFor({sub: 'kp:valid', permissions: [READ]});
+    const {model, result} = await runWorkflow(
+      [envelope({kind: 'itinerary', itinerary: VALID_ITINERARY}),
+       envelope({kind: 'itinerary', itinerary: VALID_ITINERARY})],
+      AFTERNOON_REQUEST,
+      context
+    );
+
+    expect(outputOf(result)?.kind).toBe('itinerary');
+    // Two model turns: the run and its structuring pass. No correction turn.
+    expect(model.scriptedCalls.length).toBeLessThanOrEqual(2);
+  });
+
+  it('regenerates when the first plan breaks the requested window', async () => {
+    const context = await contextFor({sub: 'kp:corrected', permissions: [READ]});
+    const {model, result} = await runWorkflow(
+      [
+        envelope({kind: 'itinerary', itinerary: INVALID_ITINERARY}),
+        envelope({kind: 'itinerary', itinerary: INVALID_ITINERARY}),
+        envelope({kind: 'itinerary', itinerary: VALID_ITINERARY}),
+        envelope({kind: 'itinerary', itinerary: VALID_ITINERARY})
+      ],
+      AFTERNOON_REQUEST,
+      context
+    );
+
+    const output = outputOf(result);
+    expect(output?.kind).toBe('itinerary');
+    expect((output?.itinerary as {activities: {startTime: string}[]}).activities[0]?.startTime).toBe('14:00');
+
+    // The correction turn told the model what was wrong.
+    const sent = JSON.stringify(model.scriptedCalls.map(c => c.prompt));
+    expect(sent).toContain('outside the requested afternoon window');
+  });
+
+  it('fails with structured issues when the correction is still invalid', async () => {
+    const context = await contextFor({sub: 'kp:stillbad', permissions: [READ]});
+
+    const failure = await runWorkflow(
+      [
+        envelope({kind: 'itinerary', itinerary: INVALID_ITINERARY}),
+        envelope({kind: 'itinerary', itinerary: INVALID_ITINERARY}),
+        envelope({kind: 'itinerary', itinerary: INVALID_ITINERARY}),
+        envelope({kind: 'itinerary', itinerary: INVALID_ITINERARY})
+      ],
+      AFTERNOON_REQUEST,
+      context
+    ).then(r => ({thrown: false as const, r}), (e: unknown) => ({thrown: true as const, e}));
+
+    if (failure.thrown) {
+      const err = failure.e as {code?: string; issues?: {code: string}[]};
+      expect(err.code).toBe('itinerary_invalid');
+      expect(err.issues?.map(i => i.code)).toContain('time_window_violation');
+    } else {
+      // A failed workflow run surfaces as a non-success status rather than a throw.
+      const status = (failure.r.result as {status?: string}).status;
+      expect(status).not.toBe('success');
+    }
+  });
+
+  it('does not validate a saved-list or message response', async () => {
+    const context = await contextFor({sub: 'kp:nonplan', permissions: [READ]});
+    const {result} = await runWorkflow(
+      [envelope({kind: 'message', message: 'Hello.'}),
+       envelope({kind: 'message', message: 'Hello.'})],
+      'What can you do?',
+      context
+    );
+
+    expect(outputOf(result)?.kind).toBe('message');
+  });
+});
+
 describe('response pass-through', () => {
   it('returns an itinerary response unchanged', async () => {
     const context = await contextFor({sub: 'kp:planner', permissions: [READ]});
@@ -263,7 +369,7 @@ describe('the workflow invokes the real agent and its tools', () => {
     );
 
     // The real save-itinerary tool ran and refused.
-    const seen = JSON.stringify(model.doGenerateCalls[1]?.prompt);
+    const seen = JSON.stringify(model.scriptedCalls.map(call => call.prompt));
     expect(seen).toContain('permission_denied');
     expect(seen).not.toContain('"saved":true');
 
@@ -289,7 +395,7 @@ describe('authenticated context and memory identity', () => {
       context
     );
 
-    const seen = JSON.stringify(model.doGenerateCalls[1]?.prompt);
+    const seen = JSON.stringify(model.scriptedCalls.map(call => call.prompt));
     expect(seen).toContain('"saved":true');
     expect(seen).toContain(`"orgCode":"${ORG}"`);
   });

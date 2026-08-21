@@ -3,6 +3,9 @@ import type {Itinerary} from '../../mastra/schemas/itinerary';
 import type {SavedItinerary} from '../../mastra/schemas/saved-itinerary';
 
 import {env} from '../env';
+import {classifyFailure, failureMessage, sanitizeDetail, type FailureKind} from './failure';
+
+export type {FailureKind};
 
 /**
  * The only place the app talks to Mastra.
@@ -37,19 +40,6 @@ export type Identity = {
 /** Header carrying a caller-supplied model key. Matches the server constant. */
 const OPENAI_KEY_HEADER = 'x-openai-api-key';
 
-/**
- * Categories the UI can act on. Derived from the server's response, never from
- * a raw provider payload.
- */
-export type FailureKind =
-  | 'auth_expired'
-  | 'org_not_allowed'
-  | 'model_key_missing'
-  | 'model_auth_failed'
-  | 'model_unreachable'
-  | 'workflow_failed'
-  | 'network'
-  | 'unknown';
 
 /** A failure worth showing a user, with the technical detail kept for the console. */
 export class MastraRequestError extends Error {
@@ -64,52 +54,12 @@ export class MastraRequestError extends Error {
   }
 }
 
-/**
- * Classify a failure from the server's own error text.
- *
- * The detail string is matched only to choose a category and a heading. It is
- * never rendered to the user directly, so a provider payload cannot reach the
- * interface through this path.
- */
-function classify(status: number, detail: string): {kind: FailureKind; message: string} {
-  if (status === 401) {
-    return {kind: 'auth_expired', message: 'Your session has expired. Sign in again to continue.'};
-  }
-  if (status === 403) {
-    return {
-      kind: 'org_not_allowed',
-      message: 'Your Kinde organization is not allowed to use this app.'
-    };
-  }
-  if (/model_key_missing|No OpenAI API key is available/i.test(detail)) {
-    return {
-      kind: 'model_key_missing',
-      message: 'Add an OpenAI API key to start planning.'
-    };
-  }
-  if (/\b401\b|invalid_api_key|incorrect api key|authentication/i.test(detail)) {
-    return {
-      kind: 'model_auth_failed',
-      message: 'OpenAI authentication failed. Check your API key and try again.'
-    };
-  }
-  if (/UND_ERR_SOCKET|ECONNREFUSED|ENOTFOUND|other side closed|Cannot connect to API|fetch failed|timed out/i.test(detail)) {
-    return {
-      kind: 'model_unreachable',
-      message: 'Could not reach OpenAI. The request could not connect to the OpenAI API.'
-    };
-  }
-  if (status >= 500) {
-    return {kind: 'workflow_failed', message: 'The planning agent could not complete this request.'};
-  }
-  return {kind: 'unknown', message: 'Something went wrong with that request. Please try again.'};
-}
-
 function friendlyError(status: number, detail: string): MastraRequestError {
-  const {kind, message} = classify(status, detail);
-  // Developers get the specifics in the console; users get a sentence.
+  const kind = classifyFailure(status, detail);
+  // The console keeps the raw text for local debugging; anything surfaced in
+  // the UI goes through sanitizeDetail first.
   console.error(`[mastra] ${status} (${kind})`, detail);
-  return new MastraRequestError(status, message, kind, detail);
+  return new MastraRequestError(status, failureMessage(kind), kind, sanitizeDetail(detail));
 }
 
 async function callMastra<T>(
@@ -135,8 +85,8 @@ async function callMastra<T>(
     console.error('[mastra] network failure', cause);
     throw new MastraRequestError(
       0,
-      `Could not reach the planner at ${env.mastraUrl}. Is the Mastra server running?`,
-      'network'
+      `Could not reach the Mastra server at ${env.mastraUrl}. Start it with "npm run dev:mastra", or run both processes with "npm run dev".`,
+      'mastra_unreachable'
     );
   }
 
@@ -148,6 +98,35 @@ async function callMastra<T>(
 }
 
 /** Identity as the server sees it — used to show who is signed in. */
+/** Conversation metadata. Never contains messages, keys or tokens. */
+export type ConversationSummary = {
+  threadId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ConversationDetail = ConversationSummary & {
+  messages: {role: string; content: unknown; createdAt: string}[];
+};
+
+/**
+ * The caller's conversations. Ownership is derived server-side from the Kinde
+ * token; no identity is sent from here.
+ */
+export function fetchConversations(token: string | undefined): Promise<{
+  conversations: ConversationSummary[];
+}> {
+  return callMastra<{conversations: ConversationSummary[]}>('/conversations', token);
+}
+
+export function fetchConversation(
+  token: string | undefined,
+  threadId: string
+): Promise<ConversationDetail> {
+  return callMastra<ConversationDetail>(`/conversations/${encodeURIComponent(threadId)}`, token);
+}
+
 export function fetchIdentity(
   token: string | undefined,
   openaiKey?: string
@@ -193,8 +172,8 @@ export async function runPlanTrip(
   if (run.status && run.status !== 'success') {
     const detail = typeof run.error === 'string' ? run.error : JSON.stringify(run.error ?? {});
     console.error('[mastra] workflow did not succeed', run);
-    const {kind, message} = classify(500, detail);
-    throw new MastraRequestError(500, message, kind, detail);
+    const kind = classifyFailure(500, detail);
+    throw new MastraRequestError(500, failureMessage(kind), kind, sanitizeDetail(detail));
   }
 
   const response = run.result as AgentResponse | undefined;

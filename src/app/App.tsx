@@ -3,12 +3,21 @@ import {useKindeAuth} from '@kinde-oss/kinde-auth-react';
 
 import {
   MastraRequestError,
+  fetchConversation,
+  fetchConversations,
   fetchIdentity,
   runPlanTrip,
+  type ConversationSummary,
   type AgentResponse,
   type Identity
 } from './lib/mastra-client';
-import {newThreadId} from './lib/thread';
+import {
+  clearActiveThreadId,
+  newThreadId,
+  readActiveThreadId,
+  writeActiveThreadId
+} from './lib/thread';
+import {FAILURE_TITLES, type FailureKind} from './lib/failure';
 import {AiKeyPanel} from './components/AiKeyPanel';
 import {ItineraryCard} from './components/ItineraryCard';
 import {SavedList} from './components/SavedList';
@@ -39,6 +48,49 @@ export function App() {
   // One thread for the whole conversation, so Memory can follow it.
   const threadId = useRef<string>(newThreadId());
 
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string | undefined>(undefined);
+  const [loadingConversation, setLoadingConversation] = useState(false);
+
+  /** Refresh the conversation list from the server, which owns the truth. */
+  const refreshConversations = useCallback(async () => {
+    try {
+      const {conversations: list} = await fetchConversations(await getAccessToken());
+      setConversations(list);
+      return list;
+    } catch (err) {
+      console.error('[app] could not list conversations', err);
+      return [];
+    }
+  }, [getAccessToken]);
+
+  /** Load a conversation, after the server has confirmed it belongs to us. */
+  const openConversation = useCallback(
+    async (id: string) => {
+      setLoadingConversation(true);
+      setError(null);
+      try {
+        const detail = await fetchConversation(await getAccessToken(), id);
+        threadId.current = detail.threadId;
+        setActiveThreadId(detail.threadId);
+        writeActiveThreadId(detail.threadId);
+        // Messages come from the server; the transcript is rebuilt from this
+        // conversation rather than from anything cached in the browser.
+        setTurns([]);
+        setRequest('');
+      } catch (err) {
+        // A thread that is gone, or was never ours, is not an error state —
+        // it just means there is nothing to resume.
+        console.error('[app] could not open conversation', err);
+        clearActiveThreadId();
+        setActiveThreadId(undefined);
+      } finally {
+        setLoadingConversation(false);
+      }
+    },
+    [getAccessToken]
+  );
+
   useEffect(() => {
     if (!isAuthenticated) return;
     void (async () => {
@@ -49,6 +101,25 @@ export function App() {
       }
     })();
   }, [isAuthenticated, getAccessToken, hasSessionKey]);
+
+  /*
+   * Startup hydration: list the caller's conversations, then resume the one
+   * they were last on — but only if it is actually in their list, so a stale
+   * or foreign id in localStorage can never select someone else's thread.
+   */
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    void (async () => {
+      const list = await refreshConversations();
+      const remembered = readActiveThreadId();
+
+      if (remembered && list.some(c => c.threadId === remembered)) {
+        await openConversation(remembered);
+      } else if (remembered) {
+        clearActiveThreadId();
+      }
+    })();
+  }, [isAuthenticated, refreshConversations, openConversation]);
 
   const send = useCallback(
     async (message: string) => {
@@ -66,6 +137,9 @@ export function App() {
           openaiKey.current
         );
         setTurns(previous => [...previous, {id: `${Date.now()}`, request: trimmed, response}]);
+        setActiveThreadId(threadId.current);
+        writeActiveThreadId(threadId.current);
+        void refreshConversations();
         // Clear the box so the natural next step — "Save this itinerary." —
         // does not require deleting the previous request first.
         setRequest('');
@@ -79,14 +153,18 @@ export function App() {
         setBusy(false);
       }
     },
-    [busy, getAccessToken]
+    [busy, getAccessToken, refreshConversations]
   );
 
   const startNewConversation = useCallback(() => {
+    // A fresh thread. Existing conversations are left untouched, and the BYOK
+    // key stays exactly where it is — in memory for this session.
     threadId.current = newThreadId();
     setTurns([]);
     setError(null);
     setRequest(EXAMPLE);
+    setActiveThreadId(undefined);
+    clearActiveThreadId();
   }, []);
 
   if (isLoading) {
@@ -206,6 +284,50 @@ export function App() {
         ) : null}
       </section>
 
+      <section className="card conversations" aria-label="Recent conversations">
+        <div className="conversations-head">
+          <h2>Recent conversations</h2>
+          <button className="btn ghost small" type="button" onClick={startNewConversation}>
+            + New conversation
+          </button>
+        </div>
+
+        {loadingConversation ? (
+          <p className="muted small" role="status">
+            Loading conversation…
+          </p>
+        ) : conversations.length === 0 ? (
+          <p className="muted small">No conversations yet. Send a request to start one.</p>
+        ) : (
+          <ul className="conversation-list">
+            {conversations.map(conversation => (
+              <li key={conversation.threadId}>
+                <button
+                  type="button"
+                  className={
+                    conversation.threadId === activeThreadId
+                      ? 'conversation-item active'
+                      : 'conversation-item'
+                  }
+                  aria-current={conversation.threadId === activeThreadId ? 'true' : undefined}
+                  onClick={() => void openConversation(conversation.threadId)}
+                >
+                  <span className="conversation-title">{conversation.title}</span>
+                  <span className="conversation-time">
+                    {new Date(conversation.updatedAt).toLocaleString(undefined, {
+                      day: 'numeric',
+                      month: 'short',
+                      hour: '2-digit',
+                      minute: '2-digit'
+                    })}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
       {error ? <ErrorPanel error={error} /> : null}
 
       {busy ? (
@@ -251,23 +373,12 @@ function ResponseView({response}: {response: AgentResponse}) {
   }
 }
 
-const ERROR_TITLES: Record<string, string> = {
-  auth_expired: 'Session expired',
-  org_not_allowed: 'Organization not allowed',
-  model_key_missing: 'OpenAI API key required',
-  model_auth_failed: 'OpenAI authentication failed',
-  model_unreachable: 'Could not reach OpenAI',
-  workflow_failed: 'Unable to build your plan',
-  network: 'Could not reach the planner',
-  unknown: 'Unable to build your plan'
-};
-
 function ErrorPanel({error}: {error: {message: string; kind: string; detail?: string}}) {
   const [showDetail, setShowDetail] = useState(false);
 
   return (
     <section className="card error" role="alert">
-      <h2>{ERROR_TITLES[error.kind] ?? ERROR_TITLES.unknown}</h2>
+      <h2>{FAILURE_TITLES[error.kind as FailureKind] ?? FAILURE_TITLES.unknown}</h2>
       <p>{error.message}</p>
       {error.detail ? (
         <>

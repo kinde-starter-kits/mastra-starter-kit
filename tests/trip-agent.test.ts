@@ -1,8 +1,16 @@
 import {describe, it, expect, afterEach, vi} from 'vitest';
+import {readFileSync} from 'node:fs';
+import {join} from 'node:path';
 
 import {ItinerarySchema} from '../src/mastra/schemas/itinerary.js';
 import {AgentResponseSchema} from '../src/mastra/schemas/agent-response.js';
-import {TRIP_AGENT_MODEL, createTripAgent, todayIso, tripAgent} from '../src/mastra/agents/trip-agent.js';
+import {
+  MODEL_MAX_RETRIES,
+  TRIP_AGENT_MODEL,
+  createTripAgent,
+  todayIso,
+  tripAgent
+} from '../src/mastra/agents/trip-agent.js';
 import {getWeatherTool} from '../src/mastra/tools/get-weather.js';
 import {findActivitiesTool} from '../src/mastra/tools/find-activities.js';
 import {saveItineraryTool} from '../src/mastra/tools/save-itinerary.js';
@@ -182,6 +190,25 @@ describe('registration and configuration', () => {
 
     expect(text).toContain('get-weather');
     expect(text).toContain('find-activities');
+  });
+});
+
+describe('model retry', () => {
+  it('retries a bounded number of times, because Mastra defaults to none', () => {
+    // Mastra's maxRetries default is 0, so a transient transport failure would
+    // otherwise surface immediately. Large uploads on some networks drop often
+    // enough that the agent needs a small retry budget.
+    expect(MODEL_MAX_RETRIES).toBe(3);
+  });
+
+  it('keeps the retry budget small enough not to be an aggressive loop', () => {
+    expect(MODEL_MAX_RETRIES).toBeGreaterThan(0);
+    expect(MODEL_MAX_RETRIES).toBeLessThanOrEqual(5);
+  });
+
+  it('configures the retry budget on the agent itself', () => {
+    const source = readFileSync(join(process.cwd(), 'src/mastra/agents/trip-agent.ts'), 'utf8');
+    expect(source).toContain('maxRetries: MODEL_MAX_RETRIES');
   });
 });
 
