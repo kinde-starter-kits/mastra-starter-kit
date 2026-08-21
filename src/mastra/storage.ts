@@ -1,6 +1,8 @@
 import {createClient, type Client} from '@libsql/client';
 import {LibSQLStore} from '@mastra/libsql';
 
+import {resolveDatabaseUrl} from './lib/database-url';
+
 /**
  * One LibSQL database backs both Mastra memory and the saved itineraries.
  * Keeping it to a single file is deliberate: `git clone && npm run dev` should
@@ -9,7 +11,12 @@ import {LibSQLStore} from '@mastra/libsql';
  * This lives in its own module so both the Mastra instance and the agent's
  * memory can share the same store without importing each other.
  */
-export const databaseUrl = process.env.DATABASE_URL ?? 'file:./mastra.db';
+/**
+ * Anchored to the project root rather than the working directory — see
+ * `resolveDatabaseUrl`. Set DATABASE_URL to point somewhere else (a Turso
+ * `libsql://` URL, for example).
+ */
+export const databaseUrl = resolveDatabaseUrl();
 
 /**
  * The raw LibSQL client, shared deliberately.
