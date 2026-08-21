@@ -5,6 +5,7 @@ import {MastraAuthKinde} from '@kinde-oss/mastra-auth-kinde';
 
 import {getKindeUser, getOrgCode, getPermissions, resourceIdForUser, PERMISSIONS} from './lib/kinde';
 import {tripAgent} from './agents/trip-agent';
+import {planTripWorkflow} from './workflows/plan-trip';
 import {storage} from './storage';
 
 export {storage};
@@ -106,7 +107,7 @@ function buildClaimWarnings(orgCode: unknown, permissions: unknown): string[] {
 export const mastra = new Mastra({
   storage,
   agents: {tripAgent},
-  workflows: {},
+  workflows: {planTripWorkflow},
   server: {
     auth,
     apiRoutes: [meRoute],
