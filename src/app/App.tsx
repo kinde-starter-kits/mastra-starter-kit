@@ -9,6 +9,7 @@ import {
   type Identity
 } from './lib/mastra-client';
 import {newThreadId} from './lib/thread';
+import {AiKeyPanel} from './components/AiKeyPanel';
 import {ItineraryCard} from './components/ItineraryCard';
 import {SavedList} from './components/SavedList';
 import {MessageCard} from './components/MessageCard';
@@ -24,7 +25,16 @@ export function App() {
   const [request, setRequest] = useState(EXAMPLE);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{message: string; kind: string; detail?: string} | null>(null);
+
+  /*
+   * The caller's OpenAI key, held in a ref so it lives in memory for this page
+   * session only. It is deliberately not React state persisted anywhere, not
+   * in localStorage, sessionStorage, a cookie, or the URL, and it is never
+   * rendered back to the screen.
+   */
+  const openaiKey = useRef<string | undefined>(undefined);
+  const [hasSessionKey, setHasSessionKey] = useState(false);
 
   // One thread for the whole conversation, so Memory can follow it.
   const threadId = useRef<string>(newThreadId());
@@ -33,12 +43,12 @@ export function App() {
     if (!isAuthenticated) return;
     void (async () => {
       try {
-        setIdentity(await fetchIdentity(await getAccessToken()));
+        setIdentity(await fetchIdentity(await getAccessToken(), openaiKey.current));
       } catch (err) {
         console.error('[app] could not load identity', err);
       }
     })();
-  }, [isAuthenticated, getAccessToken]);
+  }, [isAuthenticated, getAccessToken, hasSessionKey]);
 
   const send = useCallback(
     async (message: string) => {
@@ -50,14 +60,20 @@ export function App() {
 
       try {
         const token = await getAccessToken();
-        const response = await runPlanTrip(token, {message: trimmed, threadId: threadId.current});
+        const response = await runPlanTrip(
+          token,
+          {message: trimmed, threadId: threadId.current},
+          openaiKey.current
+        );
         setTurns(previous => [...previous, {id: `${Date.now()}`, request: trimmed, response}]);
         // Clear the box so the natural next step — "Save this itinerary." —
         // does not require deleting the previous request first.
         setRequest('');
       } catch (err) {
         setError(
-          err instanceof MastraRequestError ? err.message : 'Something went wrong. Please try again.'
+          err instanceof MastraRequestError
+            ? {message: err.message, kind: err.kind, detail: err.detail}
+            : {message: 'Something went wrong. Please try again.', kind: 'unknown'}
         );
       } finally {
         setBusy(false);
@@ -115,6 +131,19 @@ export function App() {
         <div className="who">
           <span className="email">{user?.email ?? identity?.sub ?? 'Signed in'}</span>
           {identity?.orgCode ? <span className="org">{identity.orgCode}</span> : null}
+          <AiKeyPanel
+            keySource={hasSessionKey ? 'request' : (identity?.ai?.keySource ?? null)}
+            hasSessionKey={hasSessionKey}
+            onSave={key => {
+              openaiKey.current = key;
+              setHasSessionKey(true);
+              setError(null);
+            }}
+            onClear={() => {
+              openaiKey.current = undefined;
+              setHasSessionKey(false);
+            }}
+          />
           <button className="btn ghost small" onClick={() => void logout()}>
             Sign out
           </button>
@@ -177,12 +206,7 @@ export function App() {
         ) : null}
       </section>
 
-      {error ? (
-        <section className="card error" role="alert">
-          <h2>That didn&apos;t work</h2>
-          <p>{error}</p>
-        </section>
-      ) : null}
+      {error ? <ErrorPanel error={error} /> : null}
 
       {busy ? (
         <section className="card loading" role="status" aria-live="polite">
@@ -225,6 +249,40 @@ function ResponseView({response}: {response: AgentResponse}) {
     default:
       return null;
   }
+}
+
+const ERROR_TITLES: Record<string, string> = {
+  auth_expired: 'Session expired',
+  org_not_allowed: 'Organization not allowed',
+  model_key_missing: 'OpenAI API key required',
+  model_auth_failed: 'OpenAI authentication failed',
+  model_unreachable: 'Could not reach OpenAI',
+  workflow_failed: 'Unable to build your plan',
+  network: 'Could not reach the planner',
+  unknown: 'Unable to build your plan'
+};
+
+function ErrorPanel({error}: {error: {message: string; kind: string; detail?: string}}) {
+  const [showDetail, setShowDetail] = useState(false);
+
+  return (
+    <section className="card error" role="alert">
+      <h2>{ERROR_TITLES[error.kind] ?? ERROR_TITLES.unknown}</h2>
+      <p>{error.message}</p>
+      {error.detail ? (
+        <>
+          <button
+            type="button"
+            className="btn ghost small"
+            onClick={() => setShowDetail(value => !value)}
+          >
+            {showDetail ? 'Hide details' : 'Show details'}
+          </button>
+          {showDetail ? <pre className="error-detail">{error.detail}</pre> : null}
+        </>
+      ) : null}
+    </section>
+  );
 }
 
 function PermissionPill({ok, label}: {ok: boolean; label: string}) {

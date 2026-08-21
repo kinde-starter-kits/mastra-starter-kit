@@ -157,12 +157,26 @@ DATABASE_URL=libsql://your-db.turso.io          # hosted Turso database
 
 Do not set a relative path such as `file:./mastra.db`, because that reintroduces the working-directory dependency.
 
+### Model access
+
+The agent needs an OpenAI API key, and the starter kit accepts one from either of two sources.
+
+**A key that the user supplies.** Sign in, open the **AI: OpenAI** control in the header, and enter a key. The application keeps that key in memory for the current page session and sends it with each planning request. Bring your own OpenAI API key so that the demo does not require the project maintainer to provide model access, and so that model usage is charged to your own OpenAI account.
+
+**A key that the server provides.** Set `OPENAI_API_KEY` in the server environment. This suits a private or self-hosted deployment. The value is never sent to the browser.
+
+A key supplied by a user takes precedence over the server key, so a shared deployment does not spend the maintainer's quota when the caller brought their own. When neither source provides a key, the application reports that a key is required and does not attempt a model call.
+
+The user-supplied key travels in a request header, and the server holds it in `AsyncLocalStorage` for the duration of that request. It therefore stays out of the workflow input schema, workflow state, workflow traces, working memory, and the database. The application does not write the key to `localStorage`, `sessionStorage`, a cookie, or the URL, does not log it, and does not return it in any API response. The `/me` endpoint reports only which source a request would use, never the key itself.
+
+Model usage is charged by OpenAI to the account that owns the key. The starter kit does not make the model calls free.
+
 ## Prerequisites
 
 - Node.js 22.13.0 or later, as declared in the `engines` field of `package.json`.
 - npm. The repository includes `package-lock.json`; pnpm and yarn are untested.
 - A Kinde account. The free tier is sufficient.
-- An OpenAI API key. The agent uses the `openai/gpt-4.1-mini` model through the Mastra model gateway.
+- An OpenAI API key. You can enter it in the application at run time, or set `OPENAI_API_KEY` on the server. See [Model access](#model-access). The agent uses the `openai/gpt-4.1-mini` model through the Mastra model gateway.
 
 The starter kit requires no separate database installation and no weather API key.
 
@@ -242,7 +256,8 @@ cp .env.example .env
 | `VITE_KINDE_CLIENT_ID` | Frontend | The Client ID of the SPA application. |
 | `KINDE_AUDIENCE` | Mastra server | The API identifier that you created for the Plan My Day API. The server requires each token to carry this value in its `aud` claim. |
 | `VITE_KINDE_AUDIENCE` | Frontend | The same API identifier. The frontend requests a token for this audience, so the value must match `KINDE_AUDIENCE`. |
-| `OPENAI_API_KEY` | Mastra model gateway | Resolves the `openai/gpt-4.1-mini` model. |
+
+> `OPENAI_API_KEY` is optional. See [Model access](#model-access).
 
 > The provider enforces the audience only when `KINDE_AUDIENCE` holds a value, so the code also runs with both audience variables empty. The recommended configuration for this starter kit sets them, because an API audience makes the access token an API token for your backend. If you leave them empty, complete step 3 of the Kinde setup first and then set both values together.
 
@@ -252,6 +267,7 @@ Each of the following variables has a working default.
 
 | Variable | Default | Description |
 |---|---|---|
+| `OPENAI_API_KEY` | Not set | A server-provided OpenAI key. When it is absent, each user supplies their own key in the app. A user-supplied key always takes precedence. The value is never sent to the browser. |
 | `DATABASE_URL` | `mastra.db` in the project root | An absolute `file:` path or a `libsql://` URL. |
 | `KINDE_ALLOWED_ORG_CODES` | All organizations allowed | A comma-separated allow-list of organization codes. The server returns `403` for other organizations. |
 | `KINDE_DEBUG` | Disabled | Set to `true` to log token verification failures. The log contains the error message only and never the token. |
@@ -270,7 +286,7 @@ VITE_KINDE_DOMAIN=https://your-domain.kinde.com
 VITE_KINDE_CLIENT_ID=your-client-id
 KINDE_AUDIENCE=your-api-audience
 VITE_KINDE_AUDIENCE=your-api-audience
-OPENAI_API_KEY=your-openai-key
+OPENAI_API_KEY=your-openai-key   # optional; see Model access
 ```
 
 ## Run the starter kit

@@ -118,15 +118,62 @@ describe('registration and configuration', () => {
   });
 
   it('uses the AgentResponse envelope for structured output', async () => {
-    const defaults = await tripAgent.getDefaultOptions();
+    // The production agent resolves its model per request, so a key must be
+    // available for defaults to resolve at all.
+    const previous = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-test-placeholder';
+    try {
+      const defaults = await tripAgent.getDefaultOptions();
+      expect(defaults.structuredOutput?.schema).toBe(AgentResponseSchema);
+    } finally {
+      if (previous === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previous;
+    }
+  });
 
-    expect(defaults.structuredOutput?.schema).toBe(AgentResponseSchema);
+  it('refuses to resolve a model when no key is available', async () => {
+    const previous = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      const error = await Promise.resolve()
+        .then(() => tripAgent.getDefaultOptions())
+        .then(
+          () => null,
+          (caught: unknown) => caught as {code?: string; message?: string}
+        );
+
+      expect(error?.code).toBe('model_key_missing');
+      // The message tells the user what to do and contains no key material.
+      expect(error?.message).toMatch(/Add your own key|OPENAI_API_KEY/);
+    } finally {
+      if (previous !== undefined) process.env.OPENAI_API_KEY = previous;
+    }
+  });
+
+  it('injects the schema into the prompt, which the discriminated union requires', async () => {
+    const previous = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-test-placeholder';
+    try {
+      const defaults = await tripAgent.getDefaultOptions();
+      // Without this, OpenAI's native structured-output mode cannot express a
+      // root-level oneOf and Mastra silently returns object: null.
+      expect(defaults.structuredOutput?.jsonPromptInjection).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previous;
+    }
   });
 
   it('configures a model for structured output so tools and schema can coexist', async () => {
-    const defaults = await tripAgent.getDefaultOptions();
-
-    expect(defaults.structuredOutput?.model).toBeDefined();
+    const previous = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-test-placeholder';
+    try {
+      const defaults = await tripAgent.getDefaultOptions();
+      expect(defaults.structuredOutput?.model).toBeDefined();
+    } finally {
+      if (previous === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previous;
+    }
   });
 
   it('has instructions that direct it to the tools', async () => {

@@ -1,6 +1,8 @@
 import {Agent} from '@mastra/core/agent';
 import type {MastraModelConfig} from '@mastra/core/llm';
 
+import {resolveModelConfig} from '../lib/model-key';
+
 import {AgentResponseSchema, type AgentResponse} from '../schemas/agent-response';
 import {getWeatherTool} from '../tools/get-weather';
 import {findActivitiesTool} from '../tools/find-activities';
@@ -94,7 +96,16 @@ Be concise. The plan matters, not the commentary.`;
  * schema in one request.
  */
 export function createTripAgent(options: {model?: MastraModelConfig} = {}) {
-  const model = options.model ?? TRIP_AGENT_MODEL;
+  /*
+   * Resolved per request rather than fixed at construction, so a caller who
+   * brought their own OpenAI key is billed for their own usage. The key comes
+   * from AsyncLocalStorage (see lib/model-key), never from agent input, so it
+   * cannot reach workflow state or a trace. Tests inject a scripted model,
+   * which bypasses key resolution entirely.
+   */
+  // A test may inject a scripted model; production resolves one per request.
+  const injected = options.model;
+  const model = injected ?? (() => resolveModelConfig(TRIP_AGENT_MODEL));
 
   // The object key is the tool name the model sees, so the ids are used
   // verbatim to keep the prompt, the tool, and the traces consistent.
@@ -120,25 +131,48 @@ export function createTripAgent(options: {model?: MastraModelConfig} = {}) {
     // Conversation history plus resource-scoped travel preferences. The
     // resource id comes from the verified Kinde token, never from the client.
     memory: tripMemory,
-    defaultOptions: {
-      structuredOutput: {
-        /*
-         * `AgentExecutionOptions<OUTPUT>` is declared with a naked
-         * `OUTPUT extends {} ? ...` conditional
-         * (@mastra/core/dist/agent/agent.types.d.ts:725). Naked type parameters
-         * make a conditional distributive, so a union OUTPUT is split and this
-         * schema is type-checked against only the union's last branch. No
-         * annotation on our side can rejoin it.
-         *
-         * The assertion is limited to this one property. The agent's own
-         * `TOutput` generic above still declares the full `AgentResponse`
-         * union, so callers get correct types. Runtime is unaffected and all
-         * three kinds are covered in tests/trip-agent-response.test.ts.
-         */
-        schema: AgentResponseSchema as never,
-        model
-      }
-    }
+    /*
+     * `schema` is asserted because `AgentExecutionOptions<OUTPUT>` is declared
+     * with a naked `OUTPUT extends {} ? ...` conditional
+     * (@mastra/core/dist/agent/agent.types.d.ts:725). Naked type parameters
+     * make a conditional distributive, so a union OUTPUT is split and the
+     * schema is checked against only the union's last branch. No annotation on
+     * our side can rejoin it. The agent's `TOutput` generic above still
+     * declares the full `AgentResponse` union, so callers get correct types,
+     * and all three kinds are covered in tests/trip-agent-response.test.ts.
+     */
+    /*
+     * A function, so the structuring pass resolves the same per-request key as
+     * the main model. `structuredOutput.model` alone cannot take a function.
+     */
+    defaultOptions: injected
+      ? {
+          structuredOutput: {
+            schema: AgentResponseSchema as never,
+            model: injected,
+            jsonPromptInjection: true
+          }
+        }
+      : () => ({
+          structuredOutput: {
+            schema: AgentResponseSchema as never,
+            model: resolveModelConfig(TRIP_AGENT_MODEL),
+            /*
+             * Required for the discriminated union.
+             *
+             * `AgentResponse` is a union, which becomes a root-level `oneOf` in
+             * JSON Schema. OpenAI's native structured-output mode cannot express
+             * that, and Mastra returns `object: null` with `finishReason: 'other'`
+             * instead of raising an error — the response then looks empty to the
+             * caller. Injecting the schema into the prompt avoids the native
+             * response format and produces a valid object.
+             *
+             * Verified against the live model: with this flag the union parses;
+             * without it, and with 'auto', the result is null.
+             */
+            jsonPromptInjection: true
+          }
+        }),
   });
 }
 

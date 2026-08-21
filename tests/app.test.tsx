@@ -81,7 +81,8 @@ const IDENTITY = {
   permissions: ['read:itinerary'],
   resourceId: 'org_alpha:kp:user_alice',
   can: {readItinerary: true, createItinerary: false},
-  claimWarnings: []
+  claimWarnings: [],
+  ai: {provider: 'openai' as const, keySource: null}
 };
 
 const itineraryResponse: AgentResponse = {kind: 'itinerary', itinerary: ITINERARY} as AgentResponse;
@@ -230,7 +231,10 @@ describe('saved-list rendering', () => {
 
     // Details are collapsed until asked for.
     expect(screen.queryByText('Moderate drizzle')).toBeNull();
-    await user.click(screen.getByRole('button', {expanded: false}));
+    // Scope to the saved list; the AI control also exposes aria-expanded.
+    const toggle = document.querySelector('.saved-toggle') as HTMLButtonElement;
+    expect(toggle).not.toBeNull();
+    await user.click(toggle);
     await waitFor(() => expect(screen.getByText('Moderate drizzle')).toBeDefined());
   });
 
@@ -353,6 +357,116 @@ describe('composer behaviour', () => {
     expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe(
       'Plan me an afternoon in Lagos.'
     );
+  });
+});
+
+describe('AI key control (BYOK)', () => {
+  it('prompts for a key when neither a session nor a server key exists', async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole('button', {name: /AI: OpenAI/i})).toBeDefined());
+    expect(screen.getByRole('button', {name: /add api key/i})).toBeDefined();
+  });
+
+  it('reports a server-configured key without revealing it', async () => {
+    fetchIdentity.mockResolvedValue({
+      ...IDENTITY,
+      ai: {provider: 'openai', keySource: 'server'}
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/server configured/i)).toBeDefined());
+    expect(document.body.textContent).not.toMatch(/sk-/);
+  });
+
+  it('accepts a key, masks it, and sends it as a header value never shown on screen', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', {name: /AI: OpenAI/i}));
+    const input = screen.getByLabelText(/api key/i) as HTMLInputElement;
+    expect(input.type).toBe('password');
+
+    await user.type(input, 'sk-my-secret-test-key');
+    await user.click(screen.getByRole('button', {name: /save key/i}));
+
+    await waitFor(() => expect(screen.getByText(/using your key/i)).toBeDefined());
+    // The key is never rendered back to the page.
+    expect(document.body.textContent).not.toContain('sk-my-secret-test-key');
+
+    await plan('Plan me a day.');
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
+
+    // Passed as the third argument (the header value), not inside the body.
+    const call = runPlanTrip.mock.calls.at(-1) as [string, Record<string, unknown>, string];
+    expect(call[2]).toBe('sk-my-secret-test-key');
+    expect(JSON.stringify(call[1])).not.toContain('sk-my-secret-test-key');
+  });
+
+  it('never writes the key to browser storage', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', {name: /AI: OpenAI/i}));
+    await user.type(screen.getByLabelText(/api key/i), 'sk-storage-probe');
+    await user.click(screen.getByRole('button', {name: /save key/i}));
+    await waitFor(() => expect(screen.getByText(/using your key/i)).toBeDefined());
+
+    expect(JSON.stringify(localStorage)).not.toContain('sk-storage-probe');
+    expect(JSON.stringify(sessionStorage)).not.toContain('sk-storage-probe');
+    expect(document.cookie).not.toContain('sk-storage-probe');
+    expect(window.location.href).not.toContain('sk-storage-probe');
+  });
+
+  it('clearing the key stops sending it', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', {name: /AI: OpenAI/i}));
+    await user.type(screen.getByLabelText(/api key/i), 'sk-to-be-cleared');
+    await user.click(screen.getByRole('button', {name: /save key/i}));
+    await waitFor(() => expect(screen.getByText(/using your key/i)).toBeDefined());
+
+    await user.click(screen.getByRole('button', {name: /AI: OpenAI/i}));
+    await user.click(screen.getByRole('button', {name: /clear key/i}));
+    await waitFor(() => expect(screen.getByRole('button', {name: /add api key/i})).toBeDefined());
+
+    await plan('Plan me a day.');
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
+    const call = runPlanTrip.mock.calls.at(-1) as [string, unknown, string | undefined];
+    expect(call[2]).toBeUndefined();
+  });
+});
+
+describe('error categories', () => {
+  it.each([
+    ['model_key_missing', /OpenAI API key required/i],
+    ['model_auth_failed', /OpenAI authentication failed/i],
+    ['model_unreachable', /Could not reach OpenAI/i],
+    ['workflow_failed', /Unable to build your plan/i]
+  ])('renders a specific heading for %s', async (kind, heading) => {
+    runPlanTrip.mockRejectedValue(new MastraRequestError(500, 'A friendly sentence.', kind as never));
+
+    render(<App />);
+    await plan('Plan me a day.');
+
+    await waitFor(() => expect(screen.getByRole('alert')).toBeDefined());
+    expect(screen.getByRole('alert').textContent).toMatch(heading);
+  });
+
+  it('hides technical detail behind a toggle and never shows a key', async () => {
+    const user = userEvent.setup();
+    runPlanTrip.mockRejectedValue(
+      new MastraRequestError(500, 'Could not reach OpenAI.', 'model_unreachable', 'UND_ERR_SOCKET at api.openai.com')
+    );
+
+    render(<App />);
+    await plan('Plan me a day.');
+    await waitFor(() => expect(screen.getByRole('alert')).toBeDefined());
+
+    expect(screen.queryByText(/UND_ERR_SOCKET/)).toBeNull();
+    await user.click(screen.getByRole('button', {name: /show details/i}));
+    await waitFor(() => expect(screen.getByText(/UND_ERR_SOCKET/)).toBeDefined());
+    expect(document.body.textContent).not.toMatch(/sk-[a-zA-Z0-9]/);
   });
 });
 

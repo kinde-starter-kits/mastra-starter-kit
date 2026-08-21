@@ -7,6 +7,12 @@ import {getKindeUser, getOrgCode, getPermissions, resourceIdForUser, PERMISSIONS
 import {tripAgent} from './agents/trip-agent';
 import {planTripWorkflow} from './workflows/plan-trip';
 import {storage} from './storage';
+import {
+  OPENAI_KEY_HEADER,
+  getRequestModelKey,
+  hasModelKey,
+  runWithRequestModelKey
+} from './lib/model-key';
 
 export {storage};
 
@@ -84,7 +90,18 @@ const meRoute = registerApiRoute('/me', {
       },
 
       // Surfaced so a misconfigured Kinde tenant is obvious instead of subtle.
-      claimWarnings: buildClaimWarnings(user.org_code, user.permissions)
+      claimWarnings: buildClaimWarnings(user.org_code, user.permissions),
+
+      /*
+       * Which model credential this request would use. Reports only the
+       * source, never the key, and never whether the *server* holds one when
+       * the caller supplied their own — so a client cannot probe the server's
+       * configuration beyond what it needs to render its own state.
+       */
+      ai: {
+        provider: 'openai' as const,
+        keySource: getRequestModelKey() ? ('request' as const) : hasModelKey() ? ('server' as const) : null
+      }
     });
   }
 });
@@ -111,6 +128,25 @@ export const mastra = new Mastra({
   server: {
     auth,
     apiRoutes: [meRoute],
+    middleware: [
+      {
+        /*
+         * Lift a caller-supplied OpenAI key off the request header into
+         * AsyncLocalStorage for the duration of this request.
+         *
+         * The header is read here and nowhere else. The value is never copied
+         * onto RequestContext (which Mastra can serialise into workflow
+         * snapshots), never placed in workflow input, and never logged. The
+         * header name itself is not secret; the value is, and it stays in
+         * process memory for one request.
+         */
+        path: '*',
+        handler: async (c, next) => {
+          const suppliedKey = c.req.header(OPENAI_KEY_HEADER);
+          return runWithRequestModelKey(suppliedKey, () => next());
+        }
+      }
+    ],
     // The SPA runs on a different origin in development.
     cors: {
       origin: (process.env.APP_ORIGIN ?? 'http://localhost:5173').split(','),
