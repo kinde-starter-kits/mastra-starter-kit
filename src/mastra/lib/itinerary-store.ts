@@ -1,8 +1,8 @@
 import {randomUUID} from 'node:crypto';
-import {z} from 'zod';
 
 import {libsql} from '../storage';
-import {ItinerarySchema, type Itinerary} from '../schemas/itinerary';
+import {type Itinerary} from '../schemas/itinerary';
+import {type SavedItinerary} from '../schemas/saved-itinerary';
 
 /**
  * Persistence for saved itineraries.
@@ -24,19 +24,9 @@ export type ItineraryOwner = {
   resourceId: string;
 };
 
-export const SavedItinerarySchema = z
-  .object({
-    id: z.uuid().describe('Server-generated identifier for the saved record.'),
-    itinerary: ItinerarySchema,
-    sub: z.string().min(1).describe('Kinde subject that owns this record.'),
-    orgCode: z.string().min(1).describe('Kinde organization the record belongs to.'),
-    resourceId: z.string().min(1).describe('`<org_code>:<sub>` — matches memory scoping.'),
-    createdAt: z.iso.datetime(),
-    updatedAt: z.iso.datetime()
-  })
-  .describe('An itinerary as stored, with its server-owned ownership metadata.');
-
-export type SavedItinerary = z.infer<typeof SavedItinerarySchema>;
+// The stored shape lives with the other schemas so importing it never pulls in
+// a database driver. Re-exported here so existing call sites are unaffected.
+export {SavedItinerarySchema, type SavedItinerary} from '../schemas/saved-itinerary';
 
 /** A storage failure, stated without leaking driver or SQL detail. */
 export class ItineraryStorageError extends Error {

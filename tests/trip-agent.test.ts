@@ -1,9 +1,12 @@
 import {describe, it, expect, afterEach} from 'vitest';
 
 import {ItinerarySchema} from '../src/mastra/schemas/itinerary.js';
+import {AgentResponseSchema} from '../src/mastra/schemas/agent-response.js';
 import {TRIP_AGENT_MODEL, createTripAgent, tripAgent} from '../src/mastra/agents/trip-agent.js';
 import {getWeatherTool} from '../src/mastra/tools/get-weather.js';
 import {findActivitiesTool} from '../src/mastra/tools/find-activities.js';
+import {saveItineraryTool} from '../src/mastra/tools/save-itinerary.js';
+import {listItinerariesTool} from '../src/mastra/tools/list-itineraries.js';
 import {
   LAGOS_GEOCODING,
   forecast,
@@ -70,7 +73,7 @@ function planningAgent(activityArgs: Record<string, unknown>) {
     toolCallStep('get-weather', {location: 'Lagos', date: DATE}),
     toolCallStep('find-activities', activityArgs),
     textStep('Here is your afternoon in Lagos.'),
-    textStep(JSON.stringify(ITINERARY_JSON))
+    textStep(JSON.stringify({kind: 'itinerary', itinerary: ITINERARY_JSON}))
   ]);
 
   return {model, agent: createTripAgent({model})};
@@ -99,18 +102,25 @@ describe('registration and configuration', () => {
     expect(TRIP_AGENT_MODEL).toBe('openai/gpt-4.1-mini');
   });
 
-  it('exposes both tools under their tool ids', async () => {
+  it('exposes the planning and persistence tools under their tool ids', async () => {
     const tools = await tripAgent.listTools();
 
-    expect(Object.keys(tools).sort()).toEqual(['find-activities', 'get-weather']);
+    expect(Object.keys(tools).sort()).toEqual([
+      'find-activities',
+      'get-weather',
+      'list-itineraries',
+      'save-itinerary'
+    ]);
     expect(tools['get-weather']).toBe(getWeatherTool);
     expect(tools['find-activities']).toBe(findActivitiesTool);
+    expect(tools['save-itinerary']).toBe(saveItineraryTool);
+    expect(tools['list-itineraries']).toBe(listItinerariesTool);
   });
 
-  it('uses ItinerarySchema for structured output', async () => {
+  it('uses the AgentResponse envelope for structured output', async () => {
     const defaults = await tripAgent.getDefaultOptions();
 
-    expect(defaults.structuredOutput?.schema).toBe(ItinerarySchema);
+    expect(defaults.structuredOutput?.schema).toBe(AgentResponseSchema);
   });
 
   it('configures a model for structured output so tools and schema can coexist', async () => {
@@ -152,9 +162,13 @@ describe('planning run', () => {
 
     const result = await agent.generate('Plan me an afternoon in Lagos tomorrow.');
 
-    expect(ItinerarySchema.safeParse(result.object).success).toBe(true);
-    expect(result.object?.destination).toBe('Lagos');
-    expect(result.object?.activities).toHaveLength(2);
+    expect(AgentResponseSchema.safeParse(result.object).success).toBe(true);
+    expect(result.object?.kind).toBe('itinerary');
+
+    const itinerary = result.object?.kind === 'itinerary' ? result.object.itinerary : undefined;
+    expect(ItinerarySchema.safeParse(itinerary).success).toBe(true);
+    expect(itinerary?.destination).toBe('Lagos');
+    expect(itinerary?.activities).toHaveLength(2);
   });
 
   it('runs the real weather tool and feeds its result back to the model', async () => {
@@ -194,7 +208,12 @@ describe('planning run', () => {
     await agent.generate('Plan me an afternoon in Lagos tomorrow.');
 
     const offered = (model.doGenerateCalls[0]?.tools ?? []).map(tool => tool.name).sort();
-    expect(offered).toEqual(['find-activities', 'get-weather']);
+    expect(offered).toEqual([
+      'find-activities',
+      'get-weather',
+      'list-itineraries',
+      'save-itinerary'
+    ]);
   });
 
   it('surfaces the weather tool result in the run, not invented weather', async () => {

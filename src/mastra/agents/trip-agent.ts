@@ -1,9 +1,11 @@
 import {Agent} from '@mastra/core/agent';
 import type {MastraModelConfig} from '@mastra/core/llm';
 
-import {ItinerarySchema} from '../schemas/itinerary';
+import {AgentResponseSchema, type AgentResponse} from '../schemas/agent-response';
 import {getWeatherTool} from '../tools/get-weather';
 import {findActivitiesTool} from '../tools/find-activities';
+import {saveItineraryTool} from '../tools/save-itinerary';
+import {listItinerariesTool} from '../tools/list-itineraries';
 import {tripMemory} from '../memory';
 
 /**
@@ -34,11 +36,23 @@ Rules for the plan:
 - Order activities chronologically, numbering them from 1, and give each a start time.
 - Use the notes for practical advice and for any weather trade-off worth flagging.
 
+Saving and retrieving plans:
+- Planning never saves. Only call save-itinerary when the user explicitly asks to save, keep, or remember the plan.
+- To show plans they saved before, call list-itineraries. Never invent a saved itinerary, and never describe one you did not receive from that tool.
+- Both tools enforce Kinde permissions and may refuse. When one does, say plainly that they lack the required permission and name it. Never say an itinerary was saved unless the tool reported success.
+
 Remembering the traveller:
 - You have working memory holding their standing travel preferences. Apply it silently — if they are vegetarian, pick food stops accordingly; if they dislike museums, do not offer one.
 - When they state a lasting preference ("I'm vegetarian", "I don't like museums", "I prefer late mornings"), record it in working memory so later conversations benefit.
 - Only record trip-planning preferences that fit the schema. Never record anything else they mention about themselves.
 - A one-off detail about this specific trip is not a standing preference — leave it out.
+
+How to shape your reply:
+- Every reply is one of three kinds. Pick the one that fits and fill in only its payload.
+- "itinerary" — you generated a plan. Put it under the itinerary field.
+- "saved-list" — the user asked what they saved earlier. Put the records list-itineraries returned under the itineraries field, copied exactly. If it returned none, use an empty array. Never invent entries.
+- "message" — everything else: confirming a save, explaining a permission refusal, asking a clarifying question, answering a general question.
+- After a save, reply with "message": confirm it only if save-itinerary reported success, otherwise explain the refusal and name the permission.
 
 Be concise. The plan matters, not the commentary.`;
 
@@ -59,23 +73,46 @@ Be concise. The plan matters, not the commentary.`;
 export function createTripAgent(options: {model?: MastraModelConfig} = {}) {
   const model = options.model ?? TRIP_AGENT_MODEL;
 
-  return new Agent({
+  // The object key is the tool name the model sees, so the ids are used
+  // verbatim to keep the prompt, the tool, and the traces consistent.
+  const tools = {
+    'get-weather': getWeatherTool,
+    'find-activities': findActivitiesTool,
+    // Authorization lives inside these two — they read the verified Kinde
+    // identity from the request context and enforce the permission
+    // themselves. The agent only decides when to call them.
+    'save-itinerary': saveItineraryTool,
+    'list-itineraries': listItinerariesTool
+  };
+
+  // The output type is stated rather than inferred: TypeScript collapses a
+  // discriminated union when inferring it through `defaultOptions`, narrowing
+  // it to a single branch. Naming it keeps the full union.
+  return new Agent<'trip-agent', typeof tools, AgentResponse>({
     id: 'trip-agent',
     name: 'Trip Agent',
     instructions,
     model,
-    // The object key is the tool name the model sees, so the ids are used
-    // verbatim to keep the prompt, the tool, and the traces consistent.
-    tools: {
-      'get-weather': getWeatherTool,
-      'find-activities': findActivitiesTool
-    },
+    tools,
     // Conversation history plus resource-scoped travel preferences. The
     // resource id comes from the verified Kinde token, never from the client.
     memory: tripMemory,
     defaultOptions: {
       structuredOutput: {
-        schema: ItinerarySchema,
+        /*
+         * `AgentExecutionOptions<OUTPUT>` is declared with a naked
+         * `OUTPUT extends {} ? ...` conditional
+         * (@mastra/core/dist/agent/agent.types.d.ts:725). Naked type parameters
+         * make a conditional distributive, so a union OUTPUT is split and this
+         * schema is type-checked against only the union's last branch. No
+         * annotation on our side can rejoin it.
+         *
+         * The assertion is limited to this one property. The agent's own
+         * `TOutput` generic above still declares the full `AgentResponse`
+         * union, so callers get correct types. Runtime is unaffected and all
+         * three kinds are covered in tests/trip-agent-response.test.ts.
+         */
+        schema: AgentResponseSchema as never,
         model
       }
     }
