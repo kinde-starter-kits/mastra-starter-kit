@@ -1,256 +1,396 @@
-# Plan My Day — a Mastra + Kinde starter kit
+# Plan My Day — a Kinde + Mastra starter kit
 
-A small, complete example of an AI agent that knows **who** is asking, **which organization** they belong to, and **what they are allowed to do** — using [Kinde](https://kinde.com) for identity and [Mastra](https://mastra.ai) for the agent runtime, joined by [`@kinde-oss/mastra-auth-kinde`](https://github.com/kinde-oss/mastra-auth-kinde).
+Plan My Day is a working example of an AI agent that knows which user is asking, which organization that user belongs to, and which actions that user is allowed to perform. It uses [Kinde](https://kinde.com) for identity and [Mastra](https://mastra.ai) for the agent runtime, connected by the [`@kinde-oss/mastra-auth-kinde`](https://github.com/kinde-oss/mastra-auth-kinde) provider.
 
-> **Status: foundation.** Authentication, organization gating, and identity-scoped memory addressing are implemented and tested. The planning agent and its tools are the next step — see [Roadmap](#roadmap).
+When you ask the agent to plan an afternoon, it reads the weather forecast, selects activities, and returns a structured itinerary. When you then ask it to save that itinerary, the outcome depends on the permissions in your Kinde access token. A user who holds `create:itinerary` saves the plan. A user who does not hold that permission receives a clear refusal. The prompt is identical in both cases, and only the authenticated identity differs.
 
-## What this demonstrates
+## What this starter kit demonstrates
 
-Most agent demos run as a single anonymous user. Real applications do not. This starter kit shows the part that is usually missing:
-
-| Concern | How it is handled |
+| Concern | Implementation |
 |---|---|
-| Who is the user? | Kinde issues a JWT; `MastraAuthKinde` verifies it against Kinde's JWKS |
-| Which organization? | The token's `org_code` claim, optionally restricted via `allowedOrgCodes` |
-| What may they do? | The token's `permissions` claim, checked at the tool boundary |
-| Whose memory is this? | A resource ID derived server-side from `org_code` + `sub` |
+| Authentication | Kinde SPA using Authorization Code with PKCE, a bearer token, and `MastraAuthKinde` verification of signature, issuer, expiry, and audience |
+| Organization identity | The `org_code` claim, with an optional allow-list through `allowedOrgCodes` |
+| Authorization | The `permissions` claim, checked inside the backend tools |
+| Data isolation | A resource ID derived on the server from `org_code` and `sub` |
+| Memory | Thread-scoped conversation history and resource-scoped working memory, stored in LibSQL |
+| Persistence | Saved itineraries in LibSQL, with ownership fields written from the verified token |
+| Agent | One agent with four tools and multi-step tool calling |
+| Structured output | A discriminated-union response envelope that the frontend renders directly |
+| Workflow | A typed `plan-trip` workflow that acts as the entry point |
+| Frontend | A React and Vite single-page application |
 
-The demo it builds toward: the **same agent** gives **different outcomes** depending on the signed-in user's Kinde permissions. A user with `read:itinerary` can plan and view. A user who also has `create:itinerary` can save. Nothing about the prompt changes — only the identity does.
+### The identity model
+
+The security model follows from a single derivation:
+
+```
+org_code + sub  →  server-derived resource ID  →  memory and persistence isolation
+```
+
+The provider's `mapUserToResourceId` hook produces the resource ID from the verified token. The browser cannot supply or influence this value.
 
 ## Architecture
 
-Two processes, one integration point.
+```mermaid
+flowchart TD
+    B["Browser — React SPA<br/>@kinde-oss/kinde-auth-react"]
+    K["Kinde<br/>hosted login"]
+    B -->|"1 · Authorization Code + PKCE"| K
+    K -->|"2 · access token (JWT)<br/>sub · org_code · permissions"| B
+    B -->|"3 · Authorization: Bearer &lt;token&gt;<br/>body: { message, threadId }"| A
 
-```
-┌─────────────────────────────┐
-│  Browser (Vite + React SPA) │
-│  @kinde-oss/kinde-auth-react│
-└─────────────┬───────────────┘
-              │ 1. Authorization Code + PKCE
-              ▼
-      ┌───────────────┐
-      │  Kinde tenant │  issues an access token (JWT):
-      └───────┬───────┘  sub, org_code, permissions, exp, aud…
-              │
-              │ 2. Authorization: Bearer <token>
-              ▼
-┌──────────────────────────────────────────────┐
-│  Mastra server                               │
-│                                              │
-│  MastraAuthKinde                             │
-│   ├─ authenticateToken()  JWKS verify        │
-│   ├─ authorizeUser()      org gate           │
-│   └─ mapUserToResourceId() org_code:sub      │
-│                    │                         │
-│                    ▼                         │
-│           RequestContext                     │
-│            ├─ 'user'              (claims)   │
-│            └─ mastra__resourceId  (memory)   │
-│                    │                         │
-│                    ▼                         │
-│           Agent → tools → memory             │
-│            permission check happens HERE     │
-└──────────────────────────────────────────────┘
+    subgraph S["Mastra server"]
+        direction TB
+        A["MastraAuthKinde<br/>verifies signature · issuer · expiry · audience"]
+        A -->|"authorizeUser() — organization gate"| RC
+        RC["RequestContext<br/>'user' = verified claims<br/>mastra__resourceId = org_code:sub"]
+        RC --> W["plan-trip workflow"]
+        W --> AG["trip agent"]
+        AG --> T1["get-weather<br/><i>Open-Meteo</i>"]
+        AG --> T2["find-activities<br/><i>seeded dataset</i>"]
+        AG --> T3["save-itinerary<br/><b>requires create:itinerary</b>"]
+        AG --> T4["list-itineraries<br/><b>requires read:itinerary</b>"]
+        AG --> M["Memory<br/>thread history + working memory"]
+        T3 --> DB[("LibSQL<br/>saved_itineraries")]
+        T4 --> DB
+        M --> DB
+    end
+
+    AG -->|"4 · AgentResponse"| B
 ```
 
-The browser holds a token. The server holds the trust. Nothing the browser sends — user ID, org code, resource ID — is believed.
+The browser sends only a message and a thread ID. It does not send `sub`, `org_code`, `resourceId`, or permissions, and the server ignores those fields if a client supplies them. Four mechanisms enforce this:
 
-### Project layout
+- Tool input schemas contain no identity fields, so Zod strips unknown keys before `execute` runs.
+- Mastra removes reserved keys, including `mastra__resourceId`, from any client-supplied request context.
+- Each tool reads identity from the request context rather than from its arguments.
+- Each database read is scoped with `WHERE org_code = ? AND sub = ?`.
+
+Authorization runs at the tool boundary rather than at the route boundary. An HTTP request carries no tool name, so a route-level check cannot determine which action the caller intends to perform. The tool that performs the action has that information and applies the check.
+
+## Features
+
+### Authentication
+
+The frontend is a public SPA that uses Authorization Code with PKCE through `@kinde-oss/kinde-auth-react`. This application type has no client secret, because a browser cannot store one securely, and the starter kit never asks for one.
+
+The frontend sends the access token to the Mastra server in an `Authorization: Bearer <token>` header. `MastraAuthKinde` verifies the token against the JWKS endpoint of your Kinde tenant and checks the signature, the issuer, the expiry, and the audience. This repository contains no token verification logic of its own, because the provider supplies it.
+
+The server returns `401` for requests that present no token, a malformed token, an expired token, a token from another issuer, or a token for another audience.
+
+### Authorization
+
+The starter kit defines two permissions in [`src/mastra/lib/kinde.ts`](src/mastra/lib/kinde.ts):
+
+| Permission | Required by |
+|---|---|
+| `read:itinerary` | `list-itineraries` |
+| `create:itinerary` | `save-itinerary` |
+
+The permission checks run on the server, inside the tools. They fail closed: the code treats an absent or malformed `permissions` claim as an empty permission set, so a misconfigured tenant denies access rather than granting it.
+
+The frontend applies no authorization policy. It reads a `permissionDenied` flag that the backend sets and selects a presentation for it. All policy remains on the server.
+
+A refused action returns structured data rather than raising an exception. A denied save is an expected outcome that the model explains to the user and the interface renders, so it does not interrupt the run.
+
+### Isolation
+
+- The resource ID is `org_code:sub`, derived from the verified token.
+- The server writes `sub`, `org_code`, and `resourceId` onto each saved itinerary.
+- Every read filters on both `org_code` and `sub`.
+- Users in the same organization cannot read each other's saved itineraries. This behavior was verified against a live Kinde tenant with two real users.
+- The same person signed in to two organizations receives two independent sets of saved itineraries and two independent memories.
+
+> Cross-organization isolation is covered by the automated test suite. It has not been verified against a live tenant, because the available test users belonged to the same organization.
+
+### Memory
+
+Memory is configured in [`src/mastra/memory.ts`](src/mastra/memory.ts) and has two layers:
+
+- **Conversation history** holds the last 20 messages and is scoped to a thread.
+- **Working memory** holds travel preferences and is scoped to the resource, so preferences apply across every conversation that the same user starts. A preference such as "I am vegetarian" therefore affects plans generated in later sessions.
+
+The working memory schema is a closed set of fields with no free-text entry, which limits what the agent can record to trip-planning facts:
 
 ```
-src/
-  mastra/
-    index.ts            Mastra instance: auth, storage, CORS, /me route
-    lib/kinde.ts        Identity + permission helpers (the trust boundary)
-    agents/             ← next
-    tools/              ← next
-    workflows/          ← next
-    schemas/            ← next
-  app/
-    App.tsx             Sign-in and identity panel
-    env.ts              VITE_ config with helpful errors
-    lib/mastra-client.ts  Bearer-token fetch wrapper
-tests/
-  auth.test.ts          Authentication + resource identity (integration)
-  organization.test.ts  allowedOrgCodes gating (integration)
-  kinde-identity.test.ts  Helper unit tests
-  helpers/              Fake Kinde tenant — no Kinde account needed to test
+dietary · likes · dislikes · preferredStartTime · pace · accessibility
 ```
 
-## Why Kinde
+The frontend supplies the `threadId` and generates a new one when the user starts a new conversation. The frontend never supplies the resource ID, because Mastra derives it from the token through `mapUserToResourceId`. A browser can therefore select its own conversation but cannot select whose memory it reads.
 
-An agent that can spend money, write records, or read someone's history needs an identity model, and JWT verification is easy to get subtly wrong. Kinde supplies hosted login, organizations, and a permission model; `@kinde-oss/mastra-auth-kinde` supplies the verification. This repository writes **no** authentication logic of its own — that is the point.
+### Weather
 
-## How `@kinde-oss/mastra-auth-kinde` fits in
+[`get-weather`](src/mastra/tools/get-weather.ts) uses the Open-Meteo geocoding and daily forecast endpoints, which require no API key and no account. The tool resolves a place name to coordinates, requests the forecast with `timezone=auto` so that dates refer to the local day at the destination, and returns a small stable output shape.
 
-It is a `MastraAuthProvider`, so it plugs straight into `server.auth` ([`src/mastra/index.ts`](src/mastra/index.ts)):
+The tool reports failures explicitly instead of returning substitute data. An unknown place, a date outside the available forecast range, an upstream error, and a request timeout each produce a distinct typed error.
 
-```ts
-export const auth = new MastraAuthKinde({
-  domain: process.env.KINDE_DOMAIN,
-  audience: process.env.KINDE_AUDIENCE,
-  allowedOrgCodes: parseAllowedOrgCodes(process.env.KINDE_ALLOWED_ORG_CODES),
-  mapUserToResourceId: resourceIdForUser
-});
+### Activities
 
-export const mastra = new Mastra({storage, server: {auth, apiRoutes: [meRoute]}});
+[`find-activities`](src/mastra/tools/find-activities.ts) searches a curated dataset that ships with this repository. The dataset contains 24 activities across Lagos (12), Lisbon (6), and Cape Town (6), and covers all eight categories: `outdoor`, `indoor`, `food`, `culture`, `nature`, `nightlife`, `shopping`, and `wellness`.
+
+The starter kit uses local data rather than an external places API, which removes the need for an additional API key or quota during setup. To use a different source, replace the dataset with a database query or an API call. The tool contract stays the same.
+
+Ranking is deterministic, so the same query always returns the same results in the same order. Ranking also accounts for weather: when you pass the forecast from `get-weather`, the tool lowers the rank of weather-sensitive activities and marks each result with a `weatherFit` value, which lets the agent explain the trade-off. Such activities remain in the results, so the agent can still select one when the user asks for it.
+
+### Persistence
+
+Saved itineraries are stored in LibSQL, in the `saved_itineraries` table. Each record wraps the itinerary in metadata that the server owns:
+
+```
+id · itinerary · sub · orgCode · resourceId · createdAt · updatedAt
 ```
 
-Mastra then does three things on every request, before any of your code runs:
+The `itinerary` field holds the agent-facing `ItinerarySchema` object. The server writes the ownership fields, which never originate from the model or from the client.
 
-1. **`authenticateToken(token, request)`** — verifies the signature against `<domain>/.well-known/jwks`, plus issuer, expiry, and audience. Returns the claims, or `null`.
-2. **`authorizeUser(user, request)`** — denies anonymous callers, and denies organizations outside `allowedOrgCodes` when that option is set. A `null` from step 1 is a `401`; a `false` here is a `403`.
-3. **`mapUserToResourceId(user)`** — derives the memory resource ID and stores it under the reserved `mastra__resourceId` key.
+#### Database location
 
-### How authentication works
+The default database is `mastra.db` in the project root. The path resolves from the project root rather than from the current working directory.
 
-Every Mastra route is protected by default once `server.auth` is set. The SPA attaches the Kinde access token to each call:
+This distinction is important. A relative path such as `file:./mastra.db` resolves against the directory in which the process starts, and `mastra dev` runs its bundled server from a different directory than `npm test` uses. That behavior placed the database in unexpected locations and caused `npm run dev` and `npm test` to use different files. [`src/mastra/lib/database-url.ts`](src/mastra/lib/database-url.ts) resolves the path from the project root and removes the inconsistency.
 
-```ts
-fetch(`${mastraUrl}/me`, {headers: {Authorization: `Bearer ${token}`}});
+Set `DATABASE_URL` to override the location. The value passes through unchanged:
+
+```env
+DATABASE_URL=file:/absolute/path/to/mastra.db   # explicit local file
+DATABASE_URL=libsql://your-db.turso.io          # hosted Turso database
 ```
 
-No token, an expired token, a token from another issuer, or a token for the wrong audience all produce `401` before a handler runs. You can see this yourself in [How to verify](#how-to-verify).
+Do not set a relative path such as `file:./mastra.db`, because that reintroduces the working-directory dependency.
 
-### How organization context works
+## Prerequisites
 
-Kinde puts the signed-in organization in the `org_code` claim. This kit uses it twice:
+- Node.js 22.13.0 or later, as declared in the `engines` field of `package.json`.
+- npm. The repository includes `package-lock.json`; pnpm and yarn are untested.
+- A Kinde account. The free tier is sufficient.
+- An OpenAI API key. The agent uses the `openai/gpt-4.1-mini` model through the Mastra model gateway.
 
-- **As a gate.** Set `KINDE_ALLOWED_ORG_CODES=org_abc,org_def` and tokens from any other organization get `403` at the server edge. Leave it blank to allow all organizations.
-- **As a scope.** `org_code` is the first segment of the memory resource ID, so data is partitioned by organization, not just by user.
-
-### How permissions reach the tool boundary
-
-`authorizeUser` runs per *request*, and a request carries no tool name — so it cannot decide whether *this particular action* is allowed. That decision belongs where the action happens: inside the tool.
-
-The verified claims are on the request context, so a tool reads them like this:
-
-```ts
-import {requireKindeUser, hasPermission, PERMISSIONS} from '../lib/kinde';
-
-execute: async (input, {requestContext}) => {
-  const user = requireKindeUser(requestContext);
-
-  if (!hasPermission(user, PERMISSIONS.createItinerary)) {
-    return {saved: false, reason: 'permission_denied'};
-  }
-  // ...stamp the record with user.sub and user.org_code, never with tool input
-}
-```
-
-Two rules make this safe, and both are enforced in [`src/mastra/lib/kinde.ts`](src/mastra/lib/kinde.ts):
-
-- **Identity comes from the request context, never from tool input.** A model can be talked into passing any argument; it cannot forge a JWT-derived claim.
-- **A missing `permissions` claim means "no permissions", never "allow".** A misconfigured tenant fails closed.
-
-### How memory is scoped
-
-```ts
-mapUserToResourceId: user => `${user.org_code}:${user.sub}`
-```
-
-Mastra writes that value to the reserved `mastra__resourceId` request-context key, and **reserved keys are stripped from client-supplied context**. So a browser cannot ask to read someone else's memory — the server's value always wins. Both properties are covered by tests.
-
-The same person in two Kinde organizations gets two independent memories, which is the correct behaviour for org-scoped data. Tokens with no `sub` (machine-to-machine) produce no resource ID at all, rather than a partial one.
+The starter kit requires no separate database installation and no weather API key.
 
 ## Configure Kinde
 
-You need one Kinde application and, for the permission demo, two users.
+The setup requires one application, one API, one organization, two permissions, and two users.
+
+> Kinde updates its dashboard wording from time to time. The following steps describe what to create. The exact menu labels in your dashboard can differ.
 
 ### 1. Create the application
 
-In the Kinde dashboard: **Applications → Add application → Single Page Application**.
+Create a **Front-end and mobile** application, which is the SPA application type, for the React and Vite frontend. Copy the **Client ID** and use it as `VITE_KINDE_CLIENT_ID`.
 
-- **Allowed callback URLs**: `http://localhost:5173`
-- **Allowed logout redirect URLs**: `http://localhost:5173`
+This application type has no client secret, and the starter kit never requires one.
 
-Copy the **Client ID**. There is deliberately no client secret here — a SPA uses Authorization Code + PKCE, and a secret cannot be kept secret in a browser bundle.
+### 2. Set the callback and logout URLs
 
-### 2. Turn on organizations
+Set both URLs to the origin of the frontend:
 
-**Settings → Environment → Organizations**, and make sure users sign in to an organization. Note the **organization code** (`org_...`) — that is the `org_code` claim.
+```
+Allowed callback URL:          http://localhost:5173
+Allowed logout redirect URL:   http://localhost:5173
+```
 
-### 3. Create the permissions
+> This starter kit does not implement an `/api/auth/...` callback route. The Kinde React SDK completes the PKCE redirect in the browser and returns to the application origin. [`src/app/env.ts`](src/app/env.ts) defaults both URLs to `window.location.origin`, so register the deployed origin as well when you host the frontend elsewhere.
 
-**Settings → Permissions**, add:
+### 3. Register an API and authorize the application
 
-| Permission | Meaning |
-|---|---|
-| `read:itinerary` | View saved itineraries |
-| `create:itinerary` | Save an itinerary |
+Create an API and give it an identifier such as `plan-my-day-api`. Then authorize the front-end application to request tokens for that API.
 
-Then assign them per user (directly or through a role) **inside the organization**.
+Use the same identifier for both `KINDE_AUDIENCE` on the server and `VITE_KINDE_AUDIENCE` in the frontend. The frontend requests a token for that audience, and the server requires the token to carry it, so the two values must match.
 
-For the demo, set up two users:
+> Complete this step before you start the application. A Kinde token issued without an API audience carries an empty `aud` claim, and the server rejects such a token when `KINDE_AUDIENCE` is set.
 
-- **User A** — `read:itinerary` only
-- **User B** — `read:itinerary` and `create:itinerary`
+### 4. Enable organizations
 
-### 4. Register an API (recommended)
+Configure your users to sign in to an organization so that their tokens carry an `org_code` claim. Record the organization code, which has the form `org_...`.
 
-**Settings → APIs → Add API**, with an audience such as `https://api.plan-my-day.local`, then authorize your application to use it. Put that value in **both** `KINDE_AUDIENCE` and `VITE_KINDE_AUDIENCE`.
+### 5. Create the permissions
 
-> Leave both blank until the API exists. A default Kinde token has an empty `aud`, so enabling the audience check too early rejects every token.
+Create these two permissions:
 
-> **Claim availability.** `org_code` and `permissions` appear on the access token only when organizations and the permissions claim are enabled for the application. The `/me` endpoint reports exactly which claims arrived and warns about missing ones, so you can confirm this in the browser rather than guessing.
+```
+read:itinerary
+create:itinerary
+```
 
-## Run locally
+Assign them to users within the organization rather than only at the account level. You can assign them directly or through a role. For example, a *Planner* role can hold both permissions and a *Viewer* role can hold only `read:itinerary`. The starter kit reads the `permissions` claim and does not read roles, so either assignment method works.
+
+### 6. Create two test users
+
+The two users demonstrate the difference that permissions make:
+
+| User | Permissions | Expected behavior |
+|---|---|---|
+| Planner | `read:itinerary`, `create:itinerary` | Plans, saves, and lists itineraries |
+| Viewer | `read:itinerary` | Plans and lists itineraries; the save operation is denied |
+
+### 7. Confirm that the claims arrive
+
+Sign in and check the header and the permission indicators in the application, or call `GET /me` with the access token. The endpoint returns the values that the server derived, including `sub`, `orgCode`, `permissions`, and `resourceId`, together with a `claimWarnings` array that names any missing claim. If `org_code` or `permissions` are absent, this endpoint reports the problem directly.
+
+## Environment variables
+
+Copy the example file and complete it:
+
+```bash
+cp .env.example .env
+```
+
+### Required
+
+| Variable | Used by | Description |
+|---|---|---|
+| `KINDE_DOMAIN` | Mastra server | The tenant URL. The value must include the `https://` scheme, and the provider throws an error if the variable is absent. |
+| `VITE_KINDE_DOMAIN` | Frontend | The same tenant URL. |
+| `VITE_KINDE_CLIENT_ID` | Frontend | The Client ID of the SPA application. |
+| `KINDE_AUDIENCE` | Mastra server | The API identifier that you created for the Plan My Day API. The server requires each token to carry this value in its `aud` claim. |
+| `VITE_KINDE_AUDIENCE` | Frontend | The same API identifier. The frontend requests a token for this audience, so the value must match `KINDE_AUDIENCE`. |
+| `OPENAI_API_KEY` | Mastra model gateway | Resolves the `openai/gpt-4.1-mini` model. |
+
+> The provider enforces the audience only when `KINDE_AUDIENCE` holds a value, so the code also runs with both audience variables empty. The recommended configuration for this starter kit sets them, because an API audience makes the access token an API token for your backend. If you leave them empty, complete step 3 of the Kinde setup first and then set both values together.
+
+### Optional
+
+Each of the following variables has a working default.
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `mastra.db` in the project root | An absolute `file:` path or a `libsql://` URL. |
+| `KINDE_ALLOWED_ORG_CODES` | All organizations allowed | A comma-separated allow-list of organization codes. The server returns `403` for other organizations. |
+| `KINDE_DEBUG` | Disabled | Set to `true` to log token verification failures. The log contains the error message only and never the token. |
+| `APP_ORIGIN` | `http://localhost:5173` | The CORS origin, or a comma-separated list of origins, that the Mastra server accepts. |
+| `VITE_KINDE_REDIRECT_URI` | The application origin | The redirect target after sign-in. |
+| `VITE_KINDE_LOGOUT_URI` | The application origin | The redirect target after sign-out. |
+| `VITE_MASTRA_URL` | `http://localhost:4111` | The address of the Mastra server. |
+
+### Example `.env`
+
+The following values are placeholders. Do not commit real credentials. The `.env` file is listed in `.gitignore`.
+
+```env
+KINDE_DOMAIN=https://your-domain.kinde.com
+VITE_KINDE_DOMAIN=https://your-domain.kinde.com
+VITE_KINDE_CLIENT_ID=your-client-id
+KINDE_AUDIENCE=your-api-audience
+VITE_KINDE_AUDIENCE=your-api-audience
+OPENAI_API_KEY=your-openai-key
+```
+
+## Run the starter kit
 
 ```bash
 git clone https://github.com/kinde-starter-kits/mastra-starter-kit
 cd mastra-starter-kit
 npm install
-
-cp .env.example .env   # then fill it in — see above
+cp .env.example .env   # then complete the file
 ```
 
-Two processes:
+> `npm install` installs `@kinde-oss/mastra-auth-kinde` from GitHub rather than from npm, and builds it through the package's `prepare` script.
+
+Start the two processes in separate terminals:
 
 ```bash
-npm run dev:mastra   # Mastra server on http://localhost:4111
-npm run dev:app      # SPA on http://localhost:5173
+npm run dev:mastra   # Mastra server at http://localhost:4111
+npm run dev:app      # React SPA at http://localhost:5173
 ```
 
-Open <http://localhost:5173>, sign in with Kinde, and the identity panel shows your `sub`, `org_code`, permissions, and the server-derived memory resource ID.
+Then open <http://localhost:5173> and sign in.
 
-> **Mastra Studio and auth.** With `server.auth` configured, Studio at `http://localhost:4111` is subject to the same bearer-token check as the API — the provider handles API authentication, not Studio's login UI. Use the SPA for the demo flow.
+> Mastra Studio at `http://localhost:4111` applies the same bearer-token check as the API, because `server.auth` is configured. The provider handles API authentication and does not provide the Studio login interface, so use the SPA to run the demonstration.
 
-## How to verify
+## Run the demonstration
 
-**The tests need no Kinde account.** They generate a keypair, serve a JWKS, and mint real signed tokens, so the actual provider performs actual signature verification.
+Sign in as the Planner user and send the following request:
+
+> Plan me an afternoon in Lagos tomorrow. I like outdoor activities and don't want anything too early.
+
+The agent resolves the relative date against the current date, calls `get-weather` for Lagos, passes the forecast to `find-activities`, selects activities that fit an afternoon, and returns a structured itinerary that the frontend renders as a card.
+
+Then send:
+
+> Save this itinerary.
+
+The agent calls `save-itinerary`, the tool stores the record, and the interface confirms the result.
+
+Now sign in as the Viewer user and repeat both requests. The agent still produces an itinerary. The save operation is denied, the interface displays a permission-denied state that names `create:itinerary`, and the server writes no record. When you ask the Viewer to list saved itineraries, the response contains only itineraries that the Viewer saved, and it does not include the record that the Planner saved.
+
+## HTTP API
+
+The frontend calls two endpoints on the Mastra server. Both require a valid bearer token.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/me` | Returns the identity that the server derived from the token, including `sub`, `orgCode`, `permissions`, `resourceId`, and `claimWarnings`. |
+| `POST` | `/api/workflows/planTripWorkflow/start-async` | Runs the `plan-trip` workflow to completion and returns an `AgentResponse`. The request body is `{ "inputData": { "message": "...", "threadId": "..." } }`. |
+
+## Response contract
+
+Every agent reply takes one of three shapes, defined in [`src/mastra/schemas/agent-response.ts`](src/mastra/schemas/agent-response.ts):
+
+```ts
+{ kind: 'itinerary',  itinerary: Itinerary }
+{ kind: 'saved-list', itineraries: SavedItinerary[] }
+{ kind: 'message',    message: string,
+                      permissionDenied: boolean,
+                      requiredPermission: string | null }
+```
+
+A single itinerary schema cannot represent a list of saved plans or a refusal, so the envelope carries a `kind` discriminator and only the payload that matches it. The frontend switches on `kind` and reads the `permissionDenied` flag, so it never inspects message text to determine authorization state.
+
+## Project layout
+
+```
+src/
+  mastra/
+    index.ts                 Mastra instance: auth, storage, CORS, /me route
+    storage.ts               Shared LibSQL client
+    memory.ts                Memory configuration and travel preference schema
+    agents/trip-agent.ts     Agent instructions, four tools, structured output
+    tools/
+      get-weather.ts         Open-Meteo forecast lookup
+      find-activities.ts     Seeded dataset and deterministic ranking
+      save-itinerary.ts      Requires create:itinerary
+      list-itineraries.ts    Requires read:itinerary
+    workflows/plan-trip.ts   Typed workflow entry point
+    schemas/                 itinerary, saved-itinerary, agent-response
+    lib/                     kinde identity and permissions, itinerary-store, database-url
+  app/                       React SPA
+tests/                       264 tests
+```
+
+## Tests
 
 ```bash
-npm test        # 35 tests
+npm test         # 264 tests across 14 files
 npm run typecheck
 npm run lint
 ```
 
-What they prove:
+The test suite requires no Kinde account, no OpenAI key, and no network access. It generates an RSA key pair, serves a JWKS document, and mints signed tokens, so the provider performs real signature verification. Open-Meteo responses are stubbed at the `fetch` boundary and the model is scripted turn by turn, which leaves the tools, the database, the agent, and the authentication pipeline running as they do in production.
 
-- Requests with no token, a malformed token, a forged signature, an expired token, a wrong issuer, or a wrong audience are all rejected
-- A valid Kinde identity reaches the route handler
-- A disallowed `org_code` gets `403`; an allowed one gets `200`
-- The resource ID is `org_code:sub`, differs per user and per organization, and **cannot be overridden by the client**
-- A missing `permissions` claim fails closed
+The suite verifies the following behavior, among other cases:
 
-You can also watch the gate work against the live server:
+- The server rejects malformed, expired, forged, wrong-issuer, and wrong-audience tokens.
+- The resource ID equals `org_code:sub` and a client cannot override it.
+- An absent `permissions` claim fails closed.
+- A save without `create:itinerary` is refused and writes no record.
+- One user cannot read another user's itineraries, in the same organization or in a different organization.
+- The weather forecast affects activity selection.
+
+## Deploy
+
+Build both parts with a single command:
 
 ```bash
-npm run dev:mastra
-curl -i http://localhost:4111/me                                    # 401
-curl -i -H "Authorization: Bearer bogus" http://localhost:4111/me   # 401
+npm run build      # runs "mastra build --dir src/mastra" and then "vite build"
 ```
 
-## Roadmap
+The frontend build produces static files that you can host on any static host. The Mastra server runs as a Node service. For a deployment, set the same server-side environment variables, set `DATABASE_URL` to a hosted LibSQL or Turso database instead of a local file, set `APP_ORIGIN` to the origin of the deployed frontend, and register that origin in Kinde as a callback URL and a logout redirect URL.
 
-The foundation above is done. Still to build:
+## Adapt the starter kit
 
-- `get-weather` (Open-Meteo, no API key) and `find-activities` (seeded local dataset)
-- `save-itinerary` — the authorization showcase, gated on `create:itinerary`
-- `list-itineraries` — organization-scoped reads
-- The trip agent, a structured `ItinerarySchema`, and a `plan-trip` workflow
-- Memory-backed preferences, plus the itinerary card and permission-denied UI
+- **Use real activity data.** Replace the dataset in `find-activities.ts`. The tool contract does not change.
+- **Add permissions.** Add entries to `PERMISSIONS` in `lib/kinde.ts` and check them inside the tool that performs the action.
+- **Change the model.** Update `TRIP_AGENT_MODEL` in `agents/trip-agent.ts` and set the API key for the provider you select.
+- **Restrict organizations.** Set `KINDE_ALLOWED_ORG_CODES` to a comma-separated list of organization codes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
