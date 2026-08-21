@@ -296,6 +296,48 @@ describe('save request', () => {
     expect(seen).not.toContain('"saved":true');
   });
 
+  it('carries the structured denial flag through to the response', async () => {
+    const context = await contextFor({sub: 'kp:flagged', permissions: [READ]});
+
+    const {result} = await run(
+      [
+        toolCallStep('save-itinerary', {itinerary: ITINERARY}),
+        textStep('Denied.'),
+        envelope({
+          kind: 'message',
+          message: 'You do not have permission to save itineraries.',
+          permissionDenied: true,
+          requiredPermission: CREATE
+        })
+      ],
+      'Save this itinerary.',
+      context
+    );
+
+    expect(AgentResponseSchema.safeParse(result.object).success).toBe(true);
+    expect(result.object?.kind).toBe('message');
+    if (result.object?.kind !== 'message') throw new Error('expected a message');
+    expect(result.object.permissionDenied).toBe(true);
+    expect(result.object.requiredPermission).toBe(CREATE);
+  });
+
+  it('defaults the denial fields when the agent omits them', async () => {
+    const context = await contextFor({sub: 'kp:nodefault', permissions: [READ]});
+
+    const {result} = await run(
+      [
+        envelope({kind: 'message', message: 'Hello.'}),
+        envelope({kind: 'message', message: 'Hello.'})
+      ],
+      'Hi.',
+      context
+    );
+
+    if (result.object?.kind !== 'message') throw new Error('expected a message');
+    expect(result.object.permissionDenied).toBe(false);
+    expect(result.object.requiredPermission).toBeNull();
+  });
+
   it('a denied save is not reported as an itinerary', async () => {
     const context = await contextFor({sub: 'kp:denied2', permissions: [READ]});
 

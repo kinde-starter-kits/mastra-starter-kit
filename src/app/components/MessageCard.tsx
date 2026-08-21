@@ -2,14 +2,23 @@
  * A plain reply from the agent.
  *
  * The agent uses `kind: 'message'` for confirmations, clarifying questions and
- * — the case that matters most for this starter kit — permission refusals. The
- * backend decides the wording; the UI only detects a refusal so it can style it
- * as a denial rather than an ordinary reply. No permission logic lives here.
+ * — the case that matters most for this starter kit — permission refusals.
+ *
+ * Whether something was refused is read from `permissionDenied`, which the
+ * backend sets from the tool's own result. The UI never inspects the wording
+ * and never decides policy; it only chooses how to present what the server
+ * already decided.
  */
-export function MessageCard({message}: {message: string}) {
-  const looksLikeDenial = /permission/i.test(message);
-
-  if (!looksLikeDenial) {
+export function MessageCard({
+  message,
+  permissionDenied = false,
+  requiredPermission = null
+}: {
+  message: string;
+  permissionDenied?: boolean;
+  requiredPermission?: string | null;
+}) {
+  if (!permissionDenied) {
     return (
       <article className="card message" aria-label="Reply">
         <p>{message}</p>
@@ -26,9 +35,14 @@ export function MessageCard({message}: {message: string}) {
         <h2>Not permitted</h2>
       </div>
       <p>{message}</p>
+      {requiredPermission ? (
+        <p className="small">
+          Requires <code>{requiredPermission}</code> in your Kinde organization.
+        </p>
+      ) : null}
       <p className="muted small">
         Permissions come from Kinde and are checked on the server, inside the tool that performs
-        the action. Ask an admin to grant the permission in your Kinde organization.
+        the action.
       </p>
     </article>
   );

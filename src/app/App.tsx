@@ -52,6 +52,9 @@ export function App() {
         const token = await getAccessToken();
         const response = await runPlanTrip(token, {message: trimmed, threadId: threadId.current});
         setTurns(previous => [...previous, {id: `${Date.now()}`, request: trimmed, response}]);
+        // Clear the box so the natural next step — "Save this itinerary." —
+        // does not require deleting the previous request first.
+        setRequest('');
       } catch (err) {
         setError(
           err instanceof MastraRequestError ? err.message : 'Something went wrong. Please try again.'
@@ -212,7 +215,13 @@ function ResponseView({response}: {response: AgentResponse}) {
     case 'saved-list':
       return <SavedList itineraries={response.itineraries} />;
     case 'message':
-      return <MessageCard message={response.message} />;
+      return (
+        <MessageCard
+          message={response.message}
+          permissionDenied={response.permissionDenied}
+          requiredPermission={response.requiredPermission}
+        />
+      );
     default:
       return null;
   }

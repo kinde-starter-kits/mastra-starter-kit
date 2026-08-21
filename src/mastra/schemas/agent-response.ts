@@ -48,9 +48,20 @@ export const MessageResponseSchema = z
       .describe(
         'Use for everything else — confirming a save, explaining a permission refusal, asking a clarifying question, or answering a general question.'
       ),
-    message: z.string().min(1).max(2000).describe('A concise reply for the user.')
+    message: z.string().min(1).max(2000).describe('A concise reply for the user.'),
+    permissionDenied: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Set to true when a tool refused because the user lacks a Kinde permission. Lets the UI show a denial without reading the prose.'
+      ),
+    requiredPermission: z
+      .string()
+      .nullable()
+      .default(null)
+      .describe('The permission the tool reported as missing, copied from its result.')
   })
-  .describe('A plain reply with no structured payload.');
+  .describe('A plain reply, optionally flagging that an action was refused.');
 
 export type ItineraryResponse = z.infer<typeof ItineraryResponseSchema>;
 export type SavedListResponse = z.infer<typeof SavedListResponseSchema>;

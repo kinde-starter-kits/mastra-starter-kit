@@ -70,11 +70,6 @@ async function ensureTable(): Promise<void> {
   return initialised;
 }
 
-/** Reset the memoised init. Test-only; lets a suite target a fresh database. */
-export function __resetItineraryStoreForTests(): void {
-  initialised = undefined;
-}
-
 type Row = {
   id: string;
   resource_id: string;

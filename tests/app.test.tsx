@@ -248,8 +248,9 @@ describe('permission denied', () => {
   it('renders a denial distinctly and names the permission', async () => {
     runPlanTrip.mockResolvedValue({
       kind: 'message',
-      message:
-        'You do not have permission to save itineraries. This action requires the "create:itinerary" permission in Kinde.'
+      message: 'You do not have permission to save itineraries.',
+      permissionDenied: true,
+      requiredPermission: 'create:itinerary'
     } as AgentResponse);
 
     render(<App />);
@@ -265,13 +266,32 @@ describe('permission denied', () => {
   it('renders an ordinary message without the denial styling', async () => {
     runPlanTrip.mockResolvedValue({
       kind: 'message',
-      message: 'Saved your afternoon in Lagos.'
+      message: 'Saved your afternoon in Lagos.',
+      permissionDenied: false,
+      requiredPermission: null
     } as AgentResponse);
 
     render(<App />);
     await plan('Save this itinerary.');
 
     await waitFor(() => expect(screen.getByText(/saved your afternoon/i)).toBeDefined());
+    expect(document.querySelector('.card.denied')).toBeNull();
+  });
+
+  it('does not infer denial from prose — the flag decides', async () => {
+    // Mentions "permission" but was not a refusal. Must render as an ordinary
+    // reply, proving the UI reads the flag rather than the wording.
+    runPlanTrip.mockResolvedValue({
+      kind: 'message',
+      message: 'You already have permission to save itineraries, so go ahead.',
+      permissionDenied: false,
+      requiredPermission: null
+    } as AgentResponse);
+
+    render(<App />);
+    await plan('Can I save this?');
+
+    await waitFor(() => expect(screen.getByText(/already have permission/i)).toBeDefined());
     expect(document.querySelector('.card.denied')).toBeNull();
   });
 
@@ -309,6 +329,30 @@ describe('errors', () => {
 
     await waitFor(() => expect(screen.getByRole('alert')).toBeDefined());
     expect(document.body.textContent).not.toContain('SQLITE_ERROR');
+  });
+});
+
+describe('composer behaviour', () => {
+  it('clears the box after a successful turn so the next request is easy', async () => {
+    render(<App />);
+    await plan('Plan me an afternoon in Lagos.');
+
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe('')
+    );
+  });
+
+  it('keeps the request in the box when the turn fails', async () => {
+    runPlanTrip.mockRejectedValue(new MastraRequestError(500, 'Nope.'));
+
+    render(<App />);
+    await plan('Plan me an afternoon in Lagos.');
+
+    await waitFor(() => expect(screen.getByRole('alert')).toBeDefined());
+    expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe(
+      'Plan me an afternoon in Lagos.'
+    );
   });
 });
 

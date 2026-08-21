@@ -1,8 +1,8 @@
-import {describe, it, expect, afterEach} from 'vitest';
+import {describe, it, expect, afterEach, vi} from 'vitest';
 
 import {ItinerarySchema} from '../src/mastra/schemas/itinerary.js';
 import {AgentResponseSchema} from '../src/mastra/schemas/agent-response.js';
-import {TRIP_AGENT_MODEL, createTripAgent, tripAgent} from '../src/mastra/agents/trip-agent.js';
+import {TRIP_AGENT_MODEL, createTripAgent, todayIso, tripAgent} from '../src/mastra/agents/trip-agent.js';
 import {getWeatherTool} from '../src/mastra/tools/get-weather.js';
 import {findActivitiesTool} from '../src/mastra/tools/find-activities.js';
 import {saveItineraryTool} from '../src/mastra/tools/save-itinerary.js';
@@ -135,6 +135,41 @@ describe('registration and configuration', () => {
 
     expect(text).toContain('get-weather');
     expect(text).toContain('find-activities');
+  });
+});
+
+describe('date handling', () => {
+  it("tells the agent today's date so relative dates are not guessed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-21T09:00:00Z'));
+
+    try {
+      const instructions = JSON.stringify(await tripAgent.getInstructions());
+      expect(instructions).toContain("Today's date is 2026-08-21");
+      expect(instructions).toMatch(/never against your own assumption of the date/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('recomputes the date per request rather than freezing it at import', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-02T00:00:00Z'));
+      const first = JSON.stringify(await tripAgent.getInstructions());
+
+      vi.setSystemTime(new Date('2027-03-04T00:00:00Z'));
+      const second = JSON.stringify(await tripAgent.getInstructions());
+
+      expect(first).toContain('2026-01-02');
+      expect(second).toContain('2027-03-04');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('formats the date as the YYYY-MM-DD the tools expect', () => {
+    expect(todayIso(new Date('2026-08-21T23:30:00Z'))).toBe('2026-08-21');
   });
 });
 

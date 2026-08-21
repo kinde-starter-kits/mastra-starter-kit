@@ -8,6 +8,28 @@ import {saveItineraryTool} from '../tools/save-itinerary';
 import {listItinerariesTool} from '../tools/list-itineraries';
 import {tripMemory} from '../memory';
 
+/** Today, in UTC, as YYYY-MM-DD. */
+export function todayIso(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/**
+ * Instructions are built per request so the agent is told the real date.
+ *
+ * A model has no reliable sense of "today" — it infers one from training data,
+ * so "tomorrow" would silently resolve to the wrong day and the weather tool
+ * would be queried for it. The date is computed on the server and injected
+ * here; it is never accepted from the client, and no date logic lives in the
+ * browser.
+ *
+ * The date is UTC. A traveller several hours off UTC could see "today" flip
+ * early or late; resolving that properly needs a per-user timezone, which is
+ * more machinery than this starter kit warrants.
+ */
+export function buildInstructions(): string {
+  return `${baseInstructions}\n\nToday's date is ${todayIso()}. Use it to resolve any relative date.`;
+}
+
 /**
  * The model the starter kit uses.
  *
@@ -18,10 +40,10 @@ import {tripMemory} from '../memory';
  */
 export const TRIP_AGENT_MODEL = 'openai/gpt-4.1-mini';
 
-const instructions = `You are a day-trip planner. You turn a request like "plan me an afternoon in Lisbon tomorrow" into one realistic, coherent plan for a single day.
+const baseInstructions = `You are a day-trip planner. You turn a request like "plan me an afternoon in Lisbon tomorrow" into one realistic, coherent plan for a single day.
 
 Always follow this order:
-1. Work out the destination and the date from the request. If the user gives a relative date, resolve it before calling any tool. If either is genuinely unclear, ask one short question instead of guessing.
+1. Work out the destination and the date from the request. Resolve relative dates like "tomorrow" or "this weekend" against today's date, given below, and never against your own assumption of the date. Pass an absolute YYYY-MM-DD date to the tools. If the destination or date is genuinely unclear, ask one short question instead of guessing.
 2. Call get-weather for that destination and date. Never state or assume weather yourself — it must come from the tool.
 3. Call find-activities for the same destination and date, passing the weather numbers returned by get-weather and any preferences the user expressed as tags. Never invent activities, and never call find-activities without the weather from step 2.
 4. Choose a set of activities that fits the time window the user asked for, then build the plan.
@@ -53,6 +75,7 @@ How to shape your reply:
 - "saved-list" — the user asked what they saved earlier. Put the records list-itineraries returned under the itineraries field, copied exactly. If it returned none, use an empty array. Never invent entries.
 - "message" — everything else: confirming a save, explaining a permission refusal, asking a clarifying question, answering a general question.
 - After a save, reply with "message": confirm it only if save-itinerary reported success, otherwise explain the refusal and name the permission.
+- When a tool refuses for lack of a permission, set permissionDenied to true and copy its requiredPermission into requiredPermission. Otherwise leave permissionDenied false and requiredPermission null.
 
 Be concise. The plan matters, not the commentary.`;
 
@@ -91,7 +114,7 @@ export function createTripAgent(options: {model?: MastraModelConfig} = {}) {
   return new Agent<'trip-agent', typeof tools, AgentResponse>({
     id: 'trip-agent',
     name: 'Trip Agent',
-    instructions,
+    instructions: buildInstructions,
     model,
     tools,
     // Conversation history plus resource-scoped travel preferences. The
