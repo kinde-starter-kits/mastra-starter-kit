@@ -44,17 +44,37 @@ describe('key resolution', () => {
     });
   });
 
-  it('falls back to the server key when the caller supplies none', () => {
+  it('never falls back to a server key, even when one is configured', () => {
+    /*
+     * The deciding test for a shared deployment. An earlier version resolved
+     * `OPENAI_API_KEY` when the caller sent nothing, which meant every visitor
+     * spent the maintainer's quota. Setting the variable must now have no
+     * effect on model access at all.
+     */
     process.env.OPENAI_API_KEY = SERVER_KEY;
 
     runWithRequestModelKey(undefined, () => {
-      const {apiKey, source} = resolveModelKey();
-      expect(apiKey).toBe(SERVER_KEY);
-      expect(source).toBe('server');
+      expect(() => resolveModelKey()).toThrow(ModelKeyMissingError);
     });
   });
 
-  it('reports a clear configuration error when neither key exists', () => {
+  it('does not leak a configured server key through the model config', () => {
+    process.env.OPENAI_API_KEY = SERVER_KEY;
+
+    runWithRequestModelKey(undefined, () => {
+      let thrown: unknown;
+      try {
+        resolveModelConfig('openai/gpt-4.1-mini');
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(ModelKeyMissingError);
+      expect(JSON.stringify(thrown ?? {})).not.toContain(SERVER_KEY);
+    });
+  });
+
+  it('reports a clear error naming the one thing that fixes it', () => {
     runWithRequestModelKey(undefined, () => {
       expect(() => resolveModelKey()).toThrow(ModelKeyMissingError);
 
@@ -64,7 +84,8 @@ describe('key resolution', () => {
         const err = error as ModelKeyMissingError;
         expect(err.code).toBe('model_key_missing');
         expect(err.message).toMatch(/Add your own key/);
-        expect(err.message).toMatch(/OPENAI_API_KEY/);
+        // The server variable is no longer a remedy, so it is not suggested.
+        expect(err.message).not.toMatch(/OPENAI_API_KEY/);
       }
     });
   });
@@ -113,8 +134,9 @@ describe('hasModelKey', () => {
   it('reports availability without revealing the key', () => {
     runWithRequestModelKey(undefined, () => expect(hasModelKey()).toBe(false));
 
+    // A server key is not availability: it is never used for model access.
     process.env.OPENAI_API_KEY = SERVER_KEY;
-    runWithRequestModelKey(undefined, () => expect(hasModelKey()).toBe(true));
+    runWithRequestModelKey(undefined, () => expect(hasModelKey()).toBe(false));
 
     delete process.env.OPENAI_API_KEY;
     runWithRequestModelKey(CALLER_KEY, () => expect(hasModelKey()).toBe(true));
@@ -310,5 +332,65 @@ describe('the key stays out of the surfaces added later', () => {
 
     expect(detail).not.toContain('sk-live-abcdef1234567890');
     expect(detail).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+  });
+});
+
+/**
+ * The request never leaves without a key.
+ *
+ * A shared deployment must not spend the maintainer's OpenAI quota, so the
+ * absence of a caller key has to stop the request before any network call, not
+ * after one. These drive the real agent so the check sits where production has
+ * it — in model construction — rather than in a stub.
+ */
+describe('a request with no key never reaches OpenAI', () => {
+  it('fails before any outbound call is attempted', async () => {
+    const {createTripAgent} = await import('../src/mastra/agents/trip-agent.js');
+
+    const calls: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(String(input));
+      return realFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      // A server key is present and must not rescue the request.
+      process.env.OPENAI_API_KEY = SERVER_KEY;
+      const agent = createTripAgent();
+
+      await runWithRequestModelKey(undefined, async () => {
+        await expect(agent.generate('Plan me a day.')).rejects.toThrow();
+      });
+
+      expect(calls.filter(url => url.includes('openai.com'))).toEqual([]);
+    } finally {
+      globalThis.fetch = realFetch;
+      delete process.env.OPENAI_API_KEY;
+    }
+  });
+
+  it('builds a model configuration only when the caller supplied a key', () => {
+    runWithRequestModelKey(CALLER_KEY, () => {
+      expect(resolveModelConfig('openai/gpt-4.1-mini')).toEqual({
+        id: 'openai/gpt-4.1-mini',
+        apiKey: CALLER_KEY
+      });
+    });
+
+    runWithRequestModelKey(undefined, () => {
+      expect(() => resolveModelConfig('openai/gpt-4.1-mini')).toThrow(ModelKeyMissingError);
+    });
+  });
+
+  it('classifies the missing key so the interface can ask for one', async () => {
+    const {classifyFailure, FAILURE_TITLES} = await import('../src/app/lib/failure.js');
+
+    const kind = classifyFailure(500, new ModelKeyMissingError().message);
+
+    expect(kind).toBe('model_key_missing');
+    // Not a transport problem: the user must not be told the server is down.
+    expect(kind).not.toBe('mastra_unreachable');
+    expect(FAILURE_TITLES[kind]).toMatch(/key/i);
   });
 });

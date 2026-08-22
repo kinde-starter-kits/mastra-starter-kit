@@ -31,7 +31,13 @@ export type {FailureKind};
 export type {AgentResponse, Itinerary, SavedItinerary};
 
 /** Where the model credential for a request came from. Never the key itself. */
-export type KeySource = 'request' | 'server' | null;
+/**
+ * Whose OpenAI key a request would use.
+ *
+ * The deployment is strictly bring-your-own, so this is the caller's own key or
+ * nothing. There is no server credential to fall back on.
+ */
+export type KeySource = 'request' | null;
 
 export type Identity = {
   sub: string | null;

@@ -3,6 +3,7 @@ import {createTool} from '@mastra/core/tools';
 // The WMO table is shared with the browser so an icon and this description
 // can never disagree about what the forecast said.
 import {describeWeatherCode} from '../lib/weather-conditions';
+import {LocationLookupError, LocationNotFoundError, resolveLocation} from '../lib/geocoding';
 import {z} from 'zod';
 
 /**
@@ -18,7 +19,6 @@ import {z} from 'zod';
  * response format.
  */
 
-const GEOCODING_URL = 'https://geocoding-api.open-meteo.com/v1/search';
 const FORECAST_URL = 'https://api.open-meteo.com/v1/forecast';
 
 /** Upper bound on each upstream call, so a hung request cannot stall an agent run. */
@@ -269,29 +269,7 @@ export function buildConsiderations(input: {
   return considerations.slice(0, MAX_CONSIDERATIONS);
 }
 
-async function geocode(location: string, abortSignal?: AbortSignal): Promise<GeocodingResult> {
-  const url = `${GEOCODING_URL}?name=${encodeURIComponent(location)}&count=10&language=en&format=json`;
-  const payload = (await fetchJson(url, abortSignal)) as {results?: unknown};
 
-  // Open-Meteo omits `results` entirely when nothing matches.
-  const results = Array.isArray(payload.results) ? (payload.results as GeocodingResult[]) : [];
-  const usable = results.filter(
-    result => isFiniteNumber(result?.latitude) && isFiniteNumber(result?.longitude)
-  );
-
-  if (usable.length === 0) {
-    throw new WeatherToolError(
-      'location_not_found',
-      `Could not find a place called "${location}". Try a different spelling, or add a country, for example "Lagos, Nigeria".`
-    );
-  }
-
-  const best = selectBestLocation(usable, location);
-  if (!best) {
-    throw new WeatherToolError('location_not_found', `Could not resolve "${location}".`);
-  }
-  return best;
-}
 
 /**
  * The tool's implementation, exported so the future `plan-trip` workflow can
@@ -318,7 +296,63 @@ export async function getWeatherWithValidation(
   const {location, date} = parsed.data;
   const abortSignal = context?.abortSignal;
 
-  const place = await geocode(location, abortSignal);
+  /*
+   * The same resolver the activity search uses.
+   *
+   * This tool used to geocode privately, so the two tools could disagree about
+   * where a request meant. "Portharcourt" is the case that exposed it: activity
+   * discovery resolved it and the forecast did not, and the run failed on a
+   * spelling one half of the system understood. One resolver, one answer.
+   */
+  let place: {latitude: number; longitude: number; name: string; country?: string};
+  try {
+    const resolved = await resolveLocation(location, abortSignal);
+    place = {
+      latitude: resolved.latitude,
+      longitude: resolved.longitude,
+      name: resolved.city,
+      country: resolved.country
+    };
+  } catch (error) {
+    if (error instanceof LocationNotFoundError) {
+      throw new WeatherToolError(
+        'location_not_found',
+        `Could not find a place called "${location}". Try a different spelling, or add a country, for example "Lagos, Nigeria".`
+      );
+    }
+    /*
+     * Every gazetteer was unreachable, so the place may well exist. The
+     * underlying cause is carried through rather than flattened, because a
+     * timeout, an unreachable host and a malformed response are different
+     * problems and the caller classifies them differently.
+     */
+    if (error instanceof LocationLookupError) {
+      const cause = error.cause;
+      const name = cause instanceof Error ? cause.name : '';
+
+      if (name === 'TimeoutError') {
+        throw new WeatherToolError(
+          'network_error',
+          `Weather service did not respond within ${REQUEST_TIMEOUT_MS / 1000}s. Try again.`
+        );
+      }
+      if (name === 'AbortError') {
+        throw new WeatherToolError('network_error', 'Weather lookup was cancelled.');
+      }
+      if (cause instanceof SyntaxError) {
+        throw new WeatherToolError('unexpected_response', 'Weather service returned invalid JSON.');
+      }
+      if (cause instanceof Error && /status \d+/i.test(cause.message)) {
+        throw new WeatherToolError('upstream_error', cause.message);
+      }
+
+      throw new WeatherToolError(
+        'network_error',
+        'Could not reach the weather service. Check network connectivity.'
+      );
+    }
+    throw error;
+  }
 
   // `timezone=auto` makes Open-Meteo resolve the local timezone for these
   // coordinates and return `daily.time` as local calendar dates, so the
@@ -380,7 +414,8 @@ export async function getWeatherWithValidation(
       country: place.country ?? 'Unknown',
       latitude: place.latitude,
       longitude: place.longitude,
-      timezone: (typeof payload.timezone === 'string' ? payload.timezone : place.timezone) ?? 'UTC'
+      // `timezone=auto` means the forecast response is the authority here.
+      timezone: (typeof payload.timezone === 'string' ? payload.timezone : undefined) ?? 'UTC'
     },
     date,
     summary: describeWeatherCode(weatherCode),

@@ -23,7 +23,8 @@ export function AccountMenu({
   hasSessionKey,
   onSaveKey,
   onClearKey,
-  onSignOut
+  onSignOut,
+  promptForKey = false
 }: {
   email: string;
   identity: Identity | null;
@@ -32,9 +33,24 @@ export function AccountMenu({
   onSaveKey: (key: string) => void;
   onClearKey: () => void;
   onSignOut: () => void;
+  /** Set when a plan was attempted with no key configured. */
+  promptForKey?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
+
+  /*
+   * Planning cannot start without a key, so the workspace asks this control to
+   * open rather than duplicating the form. The same input, the same save
+   * handler, and the same guarantee that the value is never rendered back.
+   */
+  const usingOwnKey = hasSessionKey || keySource === 'request';
+
+  useEffect(() => {
+    if (!promptForKey || usingOwnKey) return;
+    setOpen(true);
+    setEditing(true);
+  }, [promptForKey, usingOwnKey]);
   const [draft, setDraft] = useState('');
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -68,12 +84,7 @@ export function AccountMenu({
     };
   }, [open]);
 
-  const usingOwnKey = hasSessionKey || keySource === 'request';
-  const keyLabel = usingOwnKey
-    ? 'Using your key'
-    : keySource === 'server'
-      ? 'Using server key'
-      : 'No key configured';
+  const keyLabel = usingOwnKey ? 'Using your key' : 'No key configured';
 
   const initial = (email || '?').trim().charAt(0).toUpperCase();
 

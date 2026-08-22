@@ -1,5 +1,6 @@
 import {Mastra} from '@mastra/core/mastra';
 import {registerApiRoute} from '@mastra/core/server';
+import {VercelDeployer} from '@mastra/deployer-vercel';
 import {MASTRA_RESOURCE_ID_KEY} from '@mastra/core/request-context';
 import {MastraAuthKinde} from '@kinde-oss/mastra-auth-kinde';
 
@@ -15,7 +16,6 @@ import {planTripWorkflow} from './workflows/plan-trip';
 import {storage} from './storage';
 import {
   OPENAI_KEY_HEADER,
-  getRequestModelKey,
   hasModelKey,
   runWithRequestModelKey
 } from './lib/model-key';
@@ -100,13 +100,15 @@ const meRoute = registerApiRoute('/me', {
 
       /*
        * Which model credential this request would use. Reports only the
-       * source, never the key, and never whether the *server* holds one when
-       * the caller supplied their own — so a client cannot probe the server's
-       * configuration beyond what it needs to render its own state.
+       * source, never the key.
+       *
+       * This deployment is strictly bring-your-own, so the answer is either
+       * the caller's own key or nothing at all. There is no server credential
+       * to report and none to fall back on.
        */
       ai: {
         provider: 'openai' as const,
-        keySource: getRequestModelKey() ? ('request' as const) : hasModelKey() ? ('server' as const) : null
+        keySource: hasModelKey() ? ('request' as const) : null
       }
     });
   }
@@ -183,6 +185,30 @@ export const mastra = new Mastra({
   storage,
   agents: {tripAgent},
   workflows: {planTripWorkflow},
+  /*
+   * Deploys this same server to Vercel as one serverless function.
+   *
+   * `mastra build` hands the Hono application to `hono/vercel` and writes the
+   * Vercel Build Output API v3 layout, with every route directed at that
+   * function. Nothing about the application changes: the agent, the tools, the
+   * workflow, the auth provider, the custom routes and the middleware are the
+   * ones defined in this file. The deployer is only read by the build command.
+   */
+  deployer: new VercelDeployer({
+    /*
+     * Discovery is slower than a default serverless budget allows.
+     *
+     * Measured against the live map server: San Francisco takes about 20
+     * seconds to answer and London about 13, because a dense city matches a
+     * great many places. On the default limit the function was killed
+     * mid-request, so every tool in the run appeared to fail at once and the
+     * agent reported that it could not reach weather or activities.
+     *
+     * Sixty seconds is the ceiling on the lowest Vercel plan and leaves room
+     * for a slow query plus the model turn that follows it.
+     */
+    maxDuration: 60
+  }),
   server: {
     auth,
     apiRoutes: [meRoute, conversationsRoute, conversationRoute],

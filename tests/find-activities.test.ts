@@ -87,7 +87,8 @@ describe('basic search', () => {
       tags: expect.any(Array),
       matchedTags: expect.any(Array)
     });
-    expect(candidate!.availability.opensAt).toMatch(/^\d{2}:\d{2}$/);
+    // Seeded fixtures always record hours; discovered places may not.
+    expect(candidate!.availability?.opensAt).toMatch(/^\d{2}:\d{2}$/);
   });
 });
 

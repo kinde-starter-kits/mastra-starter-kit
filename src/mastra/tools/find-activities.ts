@@ -1,4 +1,9 @@
 import {createTool} from '@mastra/core/tools';
+
+import {resolveLocation} from '../lib/geocoding';
+import {discoverActivities} from '../lib/places';
+import {toCandidates} from '../lib/discovered-activities';
+import {rememberDiscovered} from '../lib/activity-context';
 import {z} from 'zod';
 
 import {ActivityCategorySchema} from '../schemas/itinerary';
@@ -474,7 +479,14 @@ export const ActivityCandidateSchema = z
         opensAt: z.iso.time({precision: -1}),
         closesAt: z.iso.time({precision: -1})
       })
-      .describe('When it is open, so the agent can schedule it at a sensible time.'),
+      .optional()
+      .describe(
+        'When it is open, so the agent can schedule it at a sensible time. Absent when the source does not record opening hours — treat that as unknown, never as open all day.'
+      ),
+    sourceUrl: z
+      .string()
+      .optional()
+      .describe('Where to read more about the place, when the source recorded one.'),
     tags: z.array(z.string()).describe('Descriptive tags used for preference matching.'),
     weatherFit: z
       .enum(['good', 'poor', 'unknown'])
@@ -626,7 +638,7 @@ export function tagMatches(requested: string, activityTag: string): boolean {
 }
 
 export function scoreActivity(
-  activity: SeededActivity,
+  activity: RankableActivity,
   condition: WeatherCondition | 'unknown',
   requestedTags: string[]
 ): {score: number; matchedTags: string[]; weatherFit: 'good' | 'poor' | 'unknown'} {
@@ -659,17 +671,46 @@ export function scoreActivity(
  * Implementation, exported so the future `plan-trip` workflow can call it
  * without going through the agent. Pure and synchronous: no network, no model.
  */
-export function findActivities(input: FindActivitiesInput): FindActivitiesOutput {
+/**
+ * Anything the planner can rank: a seeded fixture or a discovered place.
+ *
+ * The two differ in one way that matters here. A seeded activity always states
+ * its opening hours; a discovered one states them only when the map recorded
+ * them, so `availability` is optional.
+ */
+export type RankableActivity = Omit<SeededActivity, 'availability'> & {
+  availability?: SeededActivity['availability'];
+  sourceUrl?: string;
+};
+
+/**
+ * Rank candidates against the request.
+ *
+ * The single ranking implementation, shared by the seeded fixtures and by live
+ * discovery. Adding a second source must not add a second set of rules, because
+ * the preference hierarchy and the weather policy are the product.
+ */
+export function rankCandidates(
+  candidates: readonly RankableActivity[],
+  input: FindActivitiesInput
+): FindActivitiesOutput {
   const parsed = FindActivitiesInputSchema.parse(input);
   const {location, category, tags = [], weather, date, limit} = parsed;
 
   const condition = deriveCondition(weather);
   const weekday = date ? weekdayFor(date) : undefined;
 
-  const matches = SEEDED_ACTIVITIES.filter(activity => {
+  const matches = candidates.filter(activity => {
     if (!locationMatches(activity.location, location)) return false;
     if (category && activity.category !== category) return false;
-    if (weekday && !activity.availability.days.includes(weekday)) return false;
+    /*
+     * A day filter can only exclude a place whose opening days are known.
+     * Unknown hours mean unknown, so the place stays a candidate and the
+     * validator decides later rather than the planner silently dropping it.
+     */
+    if (weekday && activity.availability && !activity.availability.days.includes(weekday)) {
+      return false;
+    }
     return true;
   });
 
@@ -717,6 +758,7 @@ export function findActivities(input: FindActivitiesInput): FindActivitiesOutput
       weatherDependent: activity.weatherDependent,
       suitableWeather: activity.suitableWeather,
       availability: activity.availability,
+      sourceUrl: activity.sourceUrl,
       tags: activity.tags,
       weatherFit,
       matchedTags
@@ -724,11 +766,133 @@ export function findActivities(input: FindActivitiesInput): FindActivitiesOutput
   };
 }
 
+/**
+ * The seeded dataset, ranked. Kept for deterministic tests and offline work.
+ *
+ * Production no longer plans from this list — see `findActivitiesGlobal` — but
+ * the fixtures remain the fastest way to exercise ranking without the network.
+ */
+export function findActivities(input: FindActivitiesInput): FindActivitiesOutput {
+  return rankCandidates(SEEDED_ACTIVITIES, input);
+}
+
+/**
+ * Which kinds of place a request is actually asking about.
+ *
+ * Discovery is narrowed before it runs, rather than fetching everything and
+ * hoping the model picks well. The mapping reads the request's own words: a
+ * category the caller stated, the tags it supplied, and the weather. Anything
+ * unrecognised leaves the search wide, because guessing narrowly is worse than
+ * searching broadly.
+ */
+export function categoriesForRequest(input: {
+  category?: string;
+  tags?: string[];
+  severity?: WeatherSeverity;
+}): string[] {
+  const {category, tags = [], severity} = input;
+
+  // An explicit category is the clearest possible signal.
+  if (category) {
+    const direct: Record<string, string[]> = {
+      food: ['food'],
+      culture: ['culture', 'entertainment'],
+      nature: ['nature', 'outdoor'],
+      outdoor: ['outdoor', 'nature'],
+      wellness: ['wellness'],
+      shopping: ['shopping'],
+      indoor: ['culture', 'entertainment', 'food', 'wellness', 'shopping'],
+      nightlife: ['entertainment', 'food']
+    };
+    if (direct[category]) return direct[category];
+  }
+
+  const wanted = new Set<string>();
+  const said = tags.map(tag => tag.toLowerCase());
+  const mentions = (...words: string[]) =>
+    said.some(tag => words.some(word => tag.includes(word)));
+
+  if (mentions('outdoor', 'nature', 'park', 'beach', 'walk')) {
+    wanted.add('outdoor').add('nature');
+  }
+  if (mentions('indoor', 'rain', 'museum', 'gallery', 'art')) {
+    wanted.add('culture').add('entertainment');
+  }
+  if (mentions('food', 'eat', 'lunch', 'dinner', 'restaurant', 'vegetarian', 'vegan', 'cafe')) {
+    wanted.add('food');
+  }
+  if (mentions('culture', 'history', 'theatre', 'music')) wanted.add('culture');
+  if (mentions('relax', 'spa', 'wellness', 'quiet', 'slow')) {
+    wanted.add('wellness').add('nature').add('culture');
+  }
+  if (mentions('shop', 'market')) wanted.add('shopping');
+  if (mentions('family', 'kids')) wanted.add('entertainment').add('nature');
+
+  // Severe weather makes sheltered places the useful ones to look for.
+  if (severity === 'severe') {
+    wanted.add('culture').add('entertainment').add('food').add('wellness');
+  }
+
+  return [...wanted];
+}
+
+/**
+ * Plan from real places, anywhere in the world.
+ *
+ * This is the production path. The request is resolved to a point on earth,
+ * places near it are discovered, and the result is handed to the same ranking
+ * the seeded fixtures use — so the preference hierarchy and the weather policy
+ * stay in one place and apply identically to every city.
+ *
+ * Nothing here knows the name of any city.
+ */
+export async function findActivitiesGlobal(
+  input: FindActivitiesInput,
+  options: {signal?: AbortSignal} = {}
+): Promise<FindActivitiesOutput> {
+  /*
+   * `ACTIVITY_SOURCE=seeded` plans from the bundled fixtures instead.
+   *
+   * The test suite runs offline and must be deterministic, and the fixtures are
+   * also the quickest way to work on ranking without waiting on a map server.
+   * It is opt-in: production sets nothing and therefore discovers for real, so
+   * a misconfiguration cannot silently shrink the world to two cities.
+   */
+  if (process.env.ACTIVITY_SOURCE === 'seeded') return findActivities(input);
+
+  const parsed = FindActivitiesInputSchema.parse(input);
+  const severity = deriveSeverity(parsed.weather);
+
+  const place = await resolveLocation(parsed.location, options.signal);
+
+  const discovered = await discoverActivities({
+    location: place,
+    categories: categoriesForRequest({
+      category: parsed.category,
+      tags: parsed.tags,
+      severity
+    }),
+    signal: options.signal
+  });
+
+  const candidates = toCandidates(discovered, place);
+
+  /*
+   * Remember what was genuinely offered for this run. The validator checks the
+   * plan against this set, which is what lets it reject an invented venue in a
+   * city nobody has curated.
+   */
+  rememberDiscovered(place.city, candidates);
+
+  // Rank against the resolved city name, which is what the candidates carry.
+  return rankCandidates(candidates, {...parsed, location: place.city});
+}
+
 export const findActivitiesTool = createTool({
   id: 'find-activities',
   description:
-    'Find candidate activities in a city from a curated list. Call get-weather first and pass the forecast in, so activities that suit the conditions rank higher. Returns ranked candidates to choose from, not a finished plan.',
+    'Find real places to visit in any city in the world. Call get-weather first and pass the forecast in, so activities that suit the conditions rank higher. Returns ranked candidates to choose from, not a finished plan. Use only the places it returns.',
   inputSchema: FindActivitiesInputSchema,
   outputSchema: FindActivitiesOutputSchema,
-  execute: async input => findActivities(input)
+  execute: async input => findActivitiesGlobal(input)
 });

@@ -3,6 +3,7 @@ import {readFileSync} from 'node:fs';
 import {join} from 'node:path';
 
 import {ItinerarySchema} from '../src/mastra/schemas/itinerary.js';
+import {runWithRequestModelKey} from '../src/mastra/lib/model-key.js';
 import {AgentResponseSchema} from '../src/mastra/schemas/agent-response.js';
 import {
   MODEL_MAX_RETRIES,
@@ -126,17 +127,15 @@ describe('registration and configuration', () => {
   });
 
   it('uses the AgentResponse envelope for structured output', async () => {
-    // The production agent resolves its model per request, so a key must be
-    // available for defaults to resolve at all.
-    const previous = process.env.OPENAI_API_KEY;
-    process.env.OPENAI_API_KEY = 'sk-test-placeholder';
-    try {
-      const defaults = await tripAgent.getDefaultOptions();
-      expect(defaults.structuredOutput?.schema).toBe(AgentResponseSchema);
-    } finally {
-      if (previous === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = previous;
-    }
+    /*
+     * The production agent resolves its model per request from the caller's
+     * own key. There is no server fallback, so defaults only resolve inside
+     * a request scope that carries one.
+     */
+    await runWithRequestModelKey('sk-test-placeholder', async () => {
+        const defaults = await tripAgent.getDefaultOptions();
+        expect(defaults.structuredOutput?.schema).toBe(AgentResponseSchema);
+    });
   });
 
   it('refuses to resolve a model when no key is available', async () => {
@@ -159,29 +158,21 @@ describe('registration and configuration', () => {
   });
 
   it('injects the schema into the prompt, which the discriminated union requires', async () => {
-    const previous = process.env.OPENAI_API_KEY;
-    process.env.OPENAI_API_KEY = 'sk-test-placeholder';
-    try {
-      const defaults = await tripAgent.getDefaultOptions();
-      // Without this, OpenAI's native structured-output mode cannot express a
-      // root-level oneOf and Mastra silently returns object: null.
-      expect(defaults.structuredOutput?.jsonPromptInjection).toBe(true);
-    } finally {
-      if (previous === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = previous;
-    }
+    // Model resolution now accepts only the caller's key.
+    await runWithRequestModelKey('sk-test-placeholder', async () => {
+        const defaults = await tripAgent.getDefaultOptions();
+        // Without this, OpenAI's native structured-output mode cannot express a
+        // root-level oneOf and Mastra silently returns object: null.
+        expect(defaults.structuredOutput?.jsonPromptInjection).toBe(true);
+    });
   });
 
   it('configures a model for structured output so tools and schema can coexist', async () => {
-    const previous = process.env.OPENAI_API_KEY;
-    process.env.OPENAI_API_KEY = 'sk-test-placeholder';
-    try {
-      const defaults = await tripAgent.getDefaultOptions();
-      expect(defaults.structuredOutput?.model).toBeDefined();
-    } finally {
-      if (previous === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = previous;
-    }
+    // Model resolution now accepts only the caller's key.
+    await runWithRequestModelKey('sk-test-placeholder', async () => {
+        const defaults = await tripAgent.getDefaultOptions();
+        expect(defaults.structuredOutput?.model).toBeDefined();
+    });
   });
 
   it('has instructions that direct it to the tools', async () => {
