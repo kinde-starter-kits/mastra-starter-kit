@@ -42,10 +42,20 @@ import {MessageCard} from './components/MessageCard';
  * meal — is one the planner and validator both understand.
  */
 const EXAMPLES = [
-  'Plan a relaxed afternoon in Lagos tomorrow.',
-  'Plan a rainy Saturday in Lisbon.',
-  'Give me an evening in Lagos with dinner.'
+  'Plan a relaxed afternoon in Lisbon tomorrow.',
+  'Plan a rainy Saturday in Copenhagen.',
+  'Give me an evening in Mexico City with dinner.'
 ];
+
+/**
+ * Three shortcuts, in no meaningful order.
+ *
+ * They exist to save typing on a first visit, not to describe where the planner
+ * works: places come from a worldwide gazetteer and a worldwide map, so any
+ * city can be typed into the box below. Nothing here is a default, and no
+ * destination is privileged over another.
+ */
+const POPULAR_DESTINATIONS = ['San Francisco', 'London', 'Lagos'];
 
 /** The wording the server-side intent gate recognises as a request to save. */
 const SAVE_PHRASE = 'Save this itinerary.';
@@ -83,6 +93,8 @@ export function App() {
    */
   const openaiKey = useRef<string | undefined>(undefined);
   const [hasSessionKey, setHasSessionKey] = useState(false);
+  /** Set when a plan was attempted before a key was configured. */
+  const [needsKey, setNeedsKey] = useState(false);
 
   // One thread for the whole conversation, so Memory can follow it.
   const threadId = useRef<string>(newThreadId());
@@ -187,6 +199,17 @@ export function App() {
     async (message: string) => {
       const trimmed = message.trim();
       if (!trimmed || busy) return;
+
+      /*
+       * This deployment is strictly bring-your-own-key, so a request without
+       * one cannot succeed. Asking for the key here means the user sees the
+       * form rather than a failed run, and no request is sent.
+       */
+      if (!openaiKey.current) {
+        setNeedsKey(true);
+        setError(null);
+        return;
+      }
 
       setBusy(true);
       setError(null);
@@ -356,9 +379,11 @@ export function App() {
         email={user?.email ?? 'Signed in'}
         keySource={hasSessionKey ? 'request' : (identity?.ai?.keySource ?? null)}
         hasSessionKey={hasSessionKey}
+        promptForKey={needsKey}
         onSaveKey={key => {
           openaiKey.current = key;
           setHasSessionKey(true);
+          setNeedsKey(false);
           setError(null);
         }}
         onClearKey={() => {
@@ -395,6 +420,16 @@ export function App() {
               </section>
             ) : null}
 
+            {needsKey && !hasSessionKey ? (
+              <section className="card warn" role="status">
+                <h2>Add your OpenAI API key to use Plan My Day</h2>
+                <p className="small muted">
+                  Planning runs on your own OpenAI account. Open the account menu at the foot of
+                  the sidebar and add a key. It is sent with each request and kept in memory only.
+                </p>
+              </section>
+            ) : null}
+
             {turns.length === 0 && !busy && !error ? (
               <div className="empty-state">
                 <h2>What&apos;s the plan?</h2>
@@ -404,6 +439,21 @@ export function App() {
                 </p>
                 {/* Real requests, not decoration: each one names a city the
                     activity data covers and a constraint the planner honours. */}
+                <p className="section-label destinations-label">Popular destinations</p>
+                <ul className="destinations">
+                  {POPULAR_DESTINATIONS.map(city => (
+                    <li key={city}>
+                      <button
+                        type="button"
+                        className="destination"
+                        onClick={() => setRequest(`Plan a relaxed afternoon in ${city} tomorrow.`)}
+                      >
+                        {city}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+
                 <ul className="examples">
                   {EXAMPLES.map(example => (
                     <li key={example}>

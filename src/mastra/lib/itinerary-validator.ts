@@ -1,6 +1,7 @@
 import type {Itinerary} from '../schemas/itinerary';
 import type {TravelPreferences} from '../memory';
 import {SEEDED_ACTIVITIES, locationMatches, weekdayFor, type SeededActivity} from '../tools/find-activities';
+import {findKnownActivity, hasKnownActivities, type KnownActivity} from './activity-context';
 
 /**
  * Deterministic checks applied to a generated itinerary before the application
@@ -142,6 +143,31 @@ export function findSeededActivity(name: string): SeededActivity | undefined {
   return SEEDED_ACTIVITIES.find(activity => normalize(activity.name) === wanted);
 }
 
+/**
+ * The trusted record for a planned activity, wherever it came from.
+ *
+ * Provenance is the point: an activity is real because a search returned it,
+ * not because it appears in a list shipped with the repository. Discovery is
+ * checked first, since that is what production plans from, and the seeded
+ * fixtures answer for tests and offline work.
+ *
+ * `known` distinguishes "no search has run for this city" from "this place was
+ * not offered", which is the difference between being unable to verify and
+ * having caught an invention.
+ */
+export function findTrustedActivity(
+  name: string,
+  destination: string
+): {record: KnownActivity | SeededActivity | undefined; searched: boolean} {
+  const discovered = findKnownActivity(destination, name);
+  if (discovered) return {record: discovered, searched: true};
+
+  const seeded = findSeededActivity(name);
+  if (seeded) return {record: seeded, searched: true};
+
+  return {record: undefined, searched: hasKnownActivities(destination)};
+}
+
 export type ValidateInput = {
   itinerary: Itinerary;
   constraints: PlanningConstraints;
@@ -207,8 +233,8 @@ export function validateItinerary(input: ValidateInput): ValidationResult {
     previousEnd = end;
     previousName = activity.name;
 
-    // 5. Provenance: the activity must exist in the dataset.
-    const seeded = findSeededActivity(activity.name);
+    // 5. Provenance: the activity must be one a search actually returned.
+    const {record: seeded} = findTrustedActivity(activity.name, itinerary.destination);
     if (!seeded) {
       add(
         'unknown_activity',
@@ -227,18 +253,28 @@ export function validateItinerary(input: ValidateInput): ValidationResult {
       );
     }
 
-    // 4. Opening hours and day of week.
-    if (!seeded.availability.days.includes(weekday)) {
-      add('closed_on_day', `${activity.name} is not open on ${weekday}.`, activity.name);
-    }
-    const opens = toMinutes(seeded.availability.opensAt);
-    const closes = toMinutes(seeded.availability.closesAt);
-    if (start < opens || end > closes) {
-      add(
-        'outside_opening_hours',
-        `${activity.name} is scheduled ${activity.startTime}–${toClock(end)} but opens ${seeded.availability.opensAt} and closes ${seeded.availability.closesAt}.`,
-        activity.name
-      );
+    /*
+     * 4. Opening hours and day of week.
+     *
+     * Only checked when the source recorded hours. Much of the world's map data
+     * does not, and unknown hours mean unknown: the plan is neither rejected
+     * for lacking them nor allowed to claim the venue is open. Where hours do
+     * exist the rule is unchanged and just as strict.
+     */
+    const availability = seeded.availability;
+    if (availability) {
+      if (!availability.days.includes(weekday)) {
+        add('closed_on_day', `${activity.name} is not open on ${weekday}.`, activity.name);
+      }
+      const opens = toMinutes(availability.opensAt);
+      const closes = toMinutes(availability.closesAt);
+      if (start < opens || end > closes) {
+        add(
+          'outside_opening_hours',
+          `${activity.name} is scheduled ${activity.startTime}–${toClock(end)} but opens ${availability.opensAt} and closes ${availability.closesAt}.`,
+          activity.name
+        );
+      }
     }
 
     // 7. The weather-dependence flag must match the dataset.

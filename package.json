@@ -8,16 +8,18 @@
     "dev": "concurrently --names \"mastra,app\" --prefix-colors \"magenta,cyan\" --kill-others-on-fail \"npm:dev:mastra\" \"npm:dev:app\"",
     "dev:mastra": "mastra dev --dir src/mastra",
     "dev:app": "vite",
-    "build": "mastra build --dir src/mastra && vite build",
+    "build": "npm run build:server && npm run build:app",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "build:server": "node scripts/build-server.mjs",
+    "build:app": "vite build"
   },
   "license": "MIT",
   "dependencies": {
     "@kinde-oss/kinde-auth-react": "^5.13.0",
-    "@kinde-oss/mastra-auth-kinde": "github:kinde-oss/mastra-auth-kinde#move-provider-to-kinde-oss",
+    "@kinde-oss/mastra-auth-kinde": "git+https://github.com/kinde-oss/mastra-auth-kinde.git#e39f9c5a49f10480beb7abf2823f1103eb7ff4dc",
     "@libsql/client": "0.17.4",
     "@mastra/core": "^1.60.0",
     "@mastra/libsql": "^1.21.0",
@@ -29,6 +31,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@mastra/deployer-vercel": "^1.2.17",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.5",
     "@types/node": "^22.19.15",

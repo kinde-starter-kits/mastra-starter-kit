@@ -93,6 +93,7 @@ const IDENTITY = {
 const itineraryResponse: AgentResponse = {kind: 'itinerary', itinerary: ITINERARY} as AgentResponse;
 
 beforeEach(() => {
+  keyConfigured = false;
   vi.clearAllMocks();
   auth.isLoading = false;
   auth.isAuthenticated = true;
@@ -109,9 +110,37 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-/** Submit the planning form and wait for the request to be issued. */
-async function plan(message = 'Plan me an afternoon in Lagos.') {
+/**
+ * Give the session a key through the real UI.
+ *
+ * The deployment is strictly bring-your-own-key, so planning is refused until
+ * one exists. Tests that are about planning establish a key the way a user
+ * would rather than reaching past the interface.
+ */
+let keyConfigured = false;
+
+async function addKey(user: ReturnType<typeof userEvent.setup>, key = 'sk-test-session-key') {
+  await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
+  await user.click(screen.getByRole('button', {name: /add key/i}));
+  await user.type(screen.getByLabelText(/api key/i), key);
+  await user.click(screen.getByRole('button', {name: /save key/i}));
+  await waitFor(() => expect(screen.getByText(/using your key/i)).toBeDefined());
+  // Close the popover so it does not overlay the workspace.
+  await user.keyboard('{Escape}');
+  keyConfigured = true;
+}
+
+/**
+ * Submit the planning form and wait for the request to be issued.
+ *
+ * A key is established first unless the caller is specifically testing the
+ * no-key path, which passes `withKey: false`.
+ */
+async function plan(message = 'Plan me an afternoon in Lagos.', {withKey = true} = {}) {
   const user = userEvent.setup();
+  if (withKey && !keyConfigured) {
+    await addKey(user);
+  }
   const box = screen.getByLabelText(/your request/i);
   await user.clear(box);
   await user.type(box, message);
@@ -714,18 +743,15 @@ describe('AI key control (BYOK)', () => {
     expect(screen.getByText(/no key configured/i)).toBeDefined();
   });
 
-  it('reports a server-configured key without revealing it', async () => {
-    fetchIdentity.mockResolvedValue({
-      ...IDENTITY,
-      ai: {provider: 'openai', keySource: 'server'}
-    });
-
+  it('offers no server key, because the deployment has none to fall back on', async () => {
+    // A shared deployment must not spend the maintainer's OpenAI quota, so
+    // there is no server credential and nothing to report as one.
     const user = userEvent.setup();
     render(<App />);
 
     await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
-    await waitFor(() => expect(screen.getByText(/using server key/i)).toBeDefined());
-    // The server's own key is never rendered, only the fact that one exists.
+    expect(screen.getByText(/no key configured/i)).toBeDefined();
+    expect(document.body.textContent).not.toMatch(/server key/i);
     expect(document.body.textContent).not.toMatch(/sk-/);
   });
 
@@ -745,7 +771,7 @@ describe('AI key control (BYOK)', () => {
     // The key is never rendered back to the page.
     expect(document.body.textContent).not.toContain('sk-my-secret-test-key');
 
-    await plan('Plan me a day.');
+    await plan('Plan me a day.', {withKey: false});
     await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
 
     // Passed as an option (it becomes a header), never inside the request body.
@@ -787,11 +813,19 @@ describe('AI key control (BYOK)', () => {
     // The menu is still open from saving the key.
     await user.click(screen.getByRole('button', {name: /clear key/i}));
     await waitFor(() => expect(screen.getByRole('button', {name: /add key/i})).toBeDefined());
+    await user.keyboard('{Escape}');
 
-    await plan('Plan me a day.');
-    await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
-    const call = runPlanTrip.mock.calls.at(-1) as [string, unknown, {openaiKey?: string}];
-    expect(call[2].openaiKey).toBeUndefined();
+    /*
+     * With the key gone there is nothing to plan with. The request is refused
+     * before it is sent rather than sent without a credential, so the user is
+     * asked for a key again instead of watching a run fail.
+     */
+    await plan('Plan me a day.', {withKey: false});
+
+    expect(runPlanTrip).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(screen.getByText(/add your openai api key to use plan my day/i)).toBeDefined()
+    );
   });
 });
 
@@ -929,6 +963,7 @@ describe('composer', () => {
   it('submits on Enter', async () => {
     const user = userEvent.setup();
     render(<App />);
+    await addKey(user);
 
     const box = screen.getByLabelText(/your request/i);
     await user.type(box, 'Plan me an afternoon in Lagos.{Enter}');
@@ -1262,12 +1297,12 @@ describe('the empty workspace', () => {
     render(<App />);
 
     const example = await screen.findByRole('button', {
-      name: /plan a relaxed afternoon in lagos tomorrow/i
+      name: /plan a relaxed afternoon in lisbon tomorrow/i
     });
     await user.click(example);
 
     expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe(
-      'Plan a relaxed afternoon in Lagos tomorrow.'
+      'Plan a relaxed afternoon in Lisbon tomorrow.'
     );
   });
 
@@ -1328,5 +1363,40 @@ describe('the execution panel reports retries honestly', () => {
     await waitFor(() => expect(document.querySelector('.itinerary')).not.toBeNull());
 
     expect(document.body.textContent).not.toMatch(/retry|retrying/i);
+  });
+});
+
+describe('popular destinations', () => {
+  it('offers three shortcuts that fill the composer', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText(/popular destinations/i)).toBeDefined();
+    for (const city of ['San Francisco', 'London', 'Lagos']) {
+      expect(screen.getByRole('button', {name: city})).toBeDefined();
+    }
+
+    await user.click(screen.getByRole('button', {name: 'London'}));
+    expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe(
+      'Plan a relaxed afternoon in London tomorrow.'
+    );
+  });
+
+  it('does not present itself as the list of supported places', async () => {
+    render(<App />);
+    await screen.findByText(/popular destinations/i);
+
+    const shown = document.body.textContent ?? '';
+    expect(shown).not.toMatch(/supported (cities|destinations)|only.*available in/i);
+    // Any city can still be typed, so the composer is never restricted.
+    expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).disabled).toBe(false);
+  });
+
+  it('privileges no single destination as a default', async () => {
+    render(<App />);
+    await screen.findByText(/popular destinations/i);
+
+    // The composer starts empty: no city is pre-selected for the user.
+    expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe('');
   });
 });

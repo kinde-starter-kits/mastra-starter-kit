@@ -42,7 +42,8 @@ export function Sidebar({
   hasSessionKey,
   onSaveKey,
   onClearKey,
-  onSignOut
+  onSignOut,
+  promptForKey
 }: {
   open: boolean;
   conversations: ConversationSummary[];
@@ -60,6 +61,7 @@ export function Sidebar({
   onSaveKey: (key: string) => void;
   onClearKey: () => void;
   onSignOut: () => void;
+  promptForKey?: boolean;
 }) {
   // Search only earns its place once scanning the list stops being trivial.
   const searchable = conversations.length >= 6;
@@ -149,6 +151,7 @@ export function Sidebar({
           onSaveKey={onSaveKey}
           onClearKey={onClearKey}
           onSignOut={onSignOut}
+          promptForKey={promptForKey}
         />
       </div>
     </nav>

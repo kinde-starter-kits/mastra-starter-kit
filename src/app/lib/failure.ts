@@ -72,7 +72,9 @@ export function classifyFailure(status: number, detail: string): FailureKind {
   if (status === 403) return 'org_not_allowed';
   if (status === 0) return 'mastra_unreachable';
 
-  if (/model_key_missing|No OpenAI API key is available/i.test(text)) return 'model_key_missing';
+  // Matched on the stable error code first, so rewording the message cannot
+  // silently downgrade a missing key into a generic workflow failure.
+  if (/model_key_missing|No OpenAI API key/i.test(text)) return 'model_key_missing';
 
   if (/invalid_api_key|incorrect api key|Invalid Authentication|\bAuthenticationError\b/i.test(text)) {
     return 'model_auth_failed';

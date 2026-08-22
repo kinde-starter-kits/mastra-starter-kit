@@ -21,7 +21,8 @@ When you ask the agent to plan an afternoon, it reads the weather forecast, sele
 | Follow-ups | A later message edits the plan already in the conversation, using the stored structured itinerary |
 | Telemetry | Execution events streamed to the browser over the workflow stream |
 | Conversation replay | Validated responses stored on the Mastra thread, so a reopened conversation renders the original cards |
-| Model access | A caller-supplied OpenAI key per request, falling back to the server key |
+| Activity discovery | Real places anywhere in the world, from OpenStreetMap, with no provider key |
+| Model access | Strictly bring-your-own-key: each user supplies their own OpenAI key |
 | Frontend | A React and Vite single-page application |
 
 ### The identity model
@@ -52,7 +53,7 @@ flowchart TD
         RC --> W["plan-trip workflow"]
         W --> AG["trip agent"]
         AG --> T1["get-weather<br/><i>Open-Meteo</i>"]
-        AG --> T2["find-activities<br/><i>seeded dataset</i>"]
+        AG --> T2["find-activities<br/><i>Open-Meteo geocoding<br/>+ OpenStreetMap places</i>"]
         AG --> T3["save-itinerary<br/><b>requires create:itinerary</b>"]
         AG --> T4["list-itineraries<br/><b>requires read:itinerary</b>"]
         AG --> M["Memory<br/>thread history + working memory"]
@@ -127,15 +128,53 @@ The frontend supplies the `threadId` and generates a new one when the user start
 
 [`get-weather`](src/mastra/tools/get-weather.ts) uses the Open-Meteo geocoding and daily forecast endpoints, which require no API key and no account. The tool resolves a place name to coordinates, requests the forecast with `timezone=auto` so that dates refer to the local day at the destination, and returns a small stable output shape.
 
+Both this tool and the activity search resolve a place name through the same module, [`src/mastra/lib/geocoding.ts`](src/mastra/lib/geocoding.ts), so the two can never disagree about where a request means.
+
 The tool reports failures explicitly instead of returning substitute data. An unknown place, a date outside the available forecast range, an upstream error, and a request timeout each produce a distinct typed error.
 
-### Activities
+### Global activity discovery
 
-[`find-activities`](src/mastra/tools/find-activities.ts) searches a curated dataset that ships with this repository. The dataset contains 24 activities across Lagos (12), Lisbon (6), and Cape Town (6), and covers all eight categories: `outdoor`, `indoor`, `food`, `culture`, `nature`, `nightlife`, `shopping`, and `wellness`.
+[`find-activities`](src/mastra/tools/find-activities.ts) discovers real places near the requested city. There is no list of supported cities: a location is whatever a gazetteer can find, and a location that cannot be found is reported as unfindable rather than unsupported.
 
-The starter kit uses local data rather than an external places API, which removes the need for an additional API key or quota during setup. To use a different source, replace the dataset with a database query or an API call. The tool contract stays the same.
+The pipeline is:
 
-Ranking is deterministic, so the same query always returns the same results in the same order. Ranking also accounts for weather: when you pass the forecast from `get-weather`, the tool lowers the rank of weather-sensitive activities and marks each result with a `weatherFit` value, which lets the agent explain the trade-off. Such activities remain in the results, so the agent can still select one when the user asks for it.
+```
+city name → geocoding → place discovery → adapter → ranking → agent
+```
+
+| Step | Provider | Credential |
+|---|---|---|
+| Geocoding | Open-Meteo geocoding, with Nominatim as a fallback | None |
+| Place discovery | OpenStreetMap Overpass (two mirrors) | None |
+| Weather | Open-Meteo forecast | None |
+
+None of the three needs an API key, so the starter kit stays clone-and-run and there is no discovery credential that could leak.
+
+Discovery responds to the request rather than fetching everything: an asked-for category, the tags in the request, and severe weather all narrow which kinds of place are searched. Anything unrecognised leaves the search wide, because guessing narrowly is worse than searching broadly. The search widens its radius when a place is sparse, and returns few results — or none — rather than inventing any.
+
+Only places somebody could visit are returned. A plain "anything tagged tourism" query is mostly hotels and apartments, so the tool selects from an allow-list of visitable kinds: museums, galleries, theatres, parks, gardens, beaches, attractions, restaurants, cafés, markets, wellness venues and similar.
+
+Discovered places are adapted into the same shape the ranking already used, so the preference hierarchy and the weather policy apply identically everywhere. Ranking is deterministic and accounts for weather: when you pass the forecast from `get-weather`, weather-sensitive activities rank lower and each result carries a `weatherFit` value. Such activities remain in the results, so the agent can still select one when the user asks for it.
+
+The **Popular destinations** shortcuts on the empty workspace fill the composer with an example request. They are a convenience only, and any city can be typed instead.
+
+> Set `ACTIVITY_SOURCE=seeded` to plan from the small activity fixtures bundled with the repository rather than calling a map server. The test suite sets this itself so it can run offline and deterministically. It is opt-in, so production always discovers for real.
+
+#### What OpenStreetMap does and does not give you
+
+Coverage is worldwide, but density varies a great deal. A relaxed-afternoon search measured roughly 210 places in London, 200 in San Francisco and 210 in Tokyo, against 15 in Lagos and 18 in Port Harcourt. Those are real places in every case; some cities simply have less mapped.
+
+Opening hours are recorded for many venues in Europe and North America and for few elsewhere. When hours are absent the plan neither claims the venue is open nor discards it: unknown stays unknown, and the validator skips the opening-hours rule for that place. The syntax OpenStreetMap uses for hours is expressive, and only the plain unambiguous forms are read, because misreading one would state a venue is open when it is closed.
+
+Cost and price data does not exist in this source, so the agent cannot rank a day by cost. It says so instead of estimating.
+
+### Streaming execution
+
+A planning run streams what it is doing while it does it. The workflow emits execution events — the stage it has reached, each tool that ran and how long it took, each validation pass — and the browser folds them into the timeline above the itinerary.
+
+Every line comes from a real operation. There are no timers and no simulated progress, so a step shown is a step that happened and a duration shown was measured. The events carry no prompt, tool argument, tool result, credential, or resource ID.
+
+The stream is a sequence of JSON records separated by `\x1e` (RFC 7464 JSON text sequences), not newline-delimited JSON. [`src/app/lib/stream-protocol.ts`](src/app/lib/stream-protocol.ts) decodes it, and `tests/fixtures/` holds captured responses so the format is pinned to something observed rather than assumed.
 
 ### Persistence
 
@@ -162,28 +201,52 @@ DATABASE_URL=libsql://your-db.turso.io          # hosted Turso database
 
 Do not set a relative path such as `file:./mastra.db`, because that reintroduces the working-directory dependency.
 
-### Model access
+A hosted database also needs `DATABASE_AUTH_TOKEN`. It is read only when set, so a local `file:` database — which needs no credential — is unaffected.
 
-The agent needs an OpenAI API key, and the starter kit accepts one from either of two sources.
+#### Conversations
 
-**A key that the user supplies.** Sign in, open the account menu at the foot of the sidebar, and select **Add key**. The application keeps that key in memory for the current page session and sends it with each planning request. Bring your own OpenAI API key so that the demo does not require the project maintainer to provide model access, and so that model usage is charged to your own OpenAI account.
+Conversations are Mastra threads, owned by the resource ID derived from the token. There is no second conversation database.
 
-**A key that the server provides.** Set `OPENAI_API_KEY` in the server environment. This suits a private or self-hosted deployment. The value is never sent to the browser.
+When a run finishes, the validated `AgentResponse` is stored on the thread alongside the request that produced it, capped at the most recent 30 turns. Reopening a conversation replays those turns through the same cards a live run renders. Storing the envelope is what makes that possible: the agent's message text is often prose, while the structured object comes from the structuring pass and would otherwise be lost.
 
-A key supplied by a user takes precedence over the server key, so a shared deployment does not spend the maintainer's quota when the caller brought their own. When neither source provides a key, the application reports that a key is required and does not attempt a model call.
+Tool arguments and tool results are never part of a replayed turn, and an internal correction prompt is never shown as something the user said.
 
-The user-supplied key travels in a request header, and the server holds it in `AsyncLocalStorage` for the duration of that request. It therefore stays out of the workflow input schema, workflow state, workflow traces, working memory, and the database. The application does not write the key to `localStorage`, `sessionStorage`, a cookie, or the URL, does not log it, and does not return it in any API response. The `/me` endpoint reports only which source a request would use, never the key itself.
+#### Browser storage
 
-Model usage is charged by OpenAI to the account that owns the key. The starter kit does not make the model calls free.
+The browser stores exactly one value:
+
+```
+localStorage["planmyday.activeThreadId"]
+```
+
+It exists so a reload returns to the same conversation. No itinerary content, no conversation text, and no API key is written to `localStorage`, `sessionStorage`, or a cookie.
+
+### Model access — bring your own key
+
+Model access is strictly bring-your-own-key. Each user supplies their own OpenAI API key, and the server holds none.
+
+Sign in, open the account menu at the foot of the sidebar, and select **Add key**. The key is kept in memory for that page session and sent with each planning request.
+
+```
+account menu → memory → x-openai-api-key header → AsyncLocalStorage → model
+```
+
+The server reads no OpenAI key from its environment. Setting `OPENAI_API_KEY` on the server has no effect on model access, which is why the variable is absent from the configuration below. A shared deployment therefore cannot spend the maintainer's quota on a visitor's request.
+
+When no key is present, the frontend asks for one and **sends no request at all**, rather than starting a run that must fail.
+
+The key is held in `AsyncLocalStorage` for the life of the request, which keeps it out of workflow input, workflow state, workflow traces, telemetry, working memory, conversation metadata, and the database. It is never written to `localStorage`, `sessionStorage`, a cookie, or a URL, never logged, and never returned in an API response. The `/me` endpoint reports only whether a key is present, never the key.
+
+Model usage is charged by OpenAI to the account that owns the key.
 
 ## Prerequisites
 
 - Node.js 22.13.0 or later, as declared in the `engines` field of `package.json`.
 - npm. The repository includes `package-lock.json`; pnpm and yarn are untested.
 - A Kinde account. The free tier is sufficient.
-- An OpenAI API key. You can enter it in the application at run time, or set `OPENAI_API_KEY` on the server. See [Model access](#model-access). The agent uses the `openai/gpt-4.1-mini` model through the Mastra model gateway.
+- An OpenAI API key, which each user enters in the application at run time. See [Model access](#model-access--bring-your-own-key). The agent uses the `openai/gpt-4.1-mini` model through the Mastra model gateway.
 
-The starter kit requires no separate database installation and no weather API key.
+The starter kit requires no separate database installation, and no key for weather, geocoding, or place discovery.
 
 ## Configure Kinde
 
@@ -262,7 +325,7 @@ cp .env.example .env
 | `KINDE_AUDIENCE` | Mastra server | The API identifier that you created for the Plan My Day API. The server requires each token to carry this value in its `aud` claim. |
 | `VITE_KINDE_AUDIENCE` | Frontend | The same API identifier. The frontend requests a token for this audience, so the value must match `KINDE_AUDIENCE`. |
 
-> `OPENAI_API_KEY` is optional. See [Model access](#model-access).
+> There is no OpenAI variable. Each user supplies their own key in the application — see [Model access](#model-access--bring-your-own-key).
 
 > The provider enforces the audience only when `KINDE_AUDIENCE` holds a value, so the code also runs with both audience variables empty. The recommended configuration for this starter kit sets them, because an API audience makes the access token an API token for your backend. If you leave them empty, complete step 3 of the Kinde setup first and then set both values together.
 
@@ -270,16 +333,16 @@ cp .env.example .env
 
 Each of the following variables has a working default.
 
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | Not set | A server-provided OpenAI key. When it is absent, each user supplies their own key in the app. A user-supplied key always takes precedence. The value is never sent to the browser. |
-| `DATABASE_URL` | `mastra.db` in the project root | An absolute `file:` path or a `libsql://` URL. |
-| `KINDE_ALLOWED_ORG_CODES` | All organizations allowed | A comma-separated allow-list of organization codes. The server returns `403` for other organizations. |
-| `KINDE_DEBUG` | Disabled | Set to `true` to log token verification failures. The log contains the error message only and never the token. |
-| `APP_ORIGIN` | `http://localhost:5173` | The CORS origin, or a comma-separated list of origins, that the Mastra server accepts. |
-| `VITE_KINDE_REDIRECT_URI` | The application origin | The redirect target after sign-in. |
-| `VITE_KINDE_LOGOUT_URI` | The application origin | The redirect target after sign-out. |
-| `VITE_MASTRA_URL` | `http://localhost:4111` | The address of the Mastra server. |
+| Variable | Used by | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | Mastra server | `mastra.db` in the project root | An absolute `file:` path or a `libsql://` URL. |
+| `DATABASE_AUTH_TOKEN` | Mastra server | Not set | The auth token for a hosted LibSQL database. A local `file:` database needs none. |
+| `KINDE_ALLOWED_ORG_CODES` | Mastra server | All organizations allowed | A comma-separated allow-list of organization codes. The server returns `403` for other organizations. |
+| `APP_ORIGIN` | Mastra server | `http://localhost:5173` | The CORS origin, or a comma-separated list of origins, that the Mastra server accepts. A deployment must include the deployed frontend origin. |
+| `ACTIVITY_SOURCE` | Mastra server | Not set — discovery runs for real | Set to `seeded` to plan from the bundled activity fixtures instead. The test suite sets this itself. Leave unset in production. |
+| `VITE_KINDE_REDIRECT_URI` | Frontend | The application origin | The redirect target after sign-in. |
+| `VITE_KINDE_LOGOUT_URI` | Frontend | The application origin | The redirect target after sign-out. |
+| `VITE_MASTRA_URL` | Frontend | `http://localhost:4111` | The address of the Mastra server. A deployment must set this to the deployed backend origin. |
 
 ### Example `.env`
 
@@ -291,7 +354,6 @@ VITE_KINDE_DOMAIN=https://your-domain.kinde.com
 VITE_KINDE_CLIENT_ID=your-client-id
 KINDE_AUDIENCE=your-api-audience
 VITE_KINDE_AUDIENCE=your-api-audience
-OPENAI_API_KEY=your-openai-key   # optional; see Model access
 ```
 
 ## Run the starter kit
@@ -305,12 +367,20 @@ cp .env.example .env   # then complete the file
 
 > `npm install` installs `@kinde-oss/mastra-auth-kinde` from GitHub rather than from npm, and builds it through the package's `prepare` script.
 
-Start the two processes in separate terminals:
+Start both processes:
+
+```bash
+npm run dev          # Mastra server on :4111 and the React SPA on :5173
+```
+
+Or run them separately, in two terminals:
 
 ```bash
 npm run dev:mastra   # Mastra server at http://localhost:4111
 npm run dev:app      # React SPA at http://localhost:5173
 ```
+
+Local development stores everything in a `mastra.db` file at the project root. No database service is needed.
 
 Then open <http://localhost:5173> and sign in.
 
@@ -373,7 +443,7 @@ src/
     agents/trip-agent.ts     Agent instructions, four tools, structured output
     tools/
       get-weather.ts         Open-Meteo forecast lookup
-      find-activities.ts     Seeded dataset and deterministic ranking
+      find-activities.ts     Global discovery, ranking, seeded fixtures
       save-itinerary.ts      Requires create:itinerary
       list-itineraries.ts    Requires read:itinerary
     workflows/plan-trip.ts   Typed workflow entry point
@@ -381,6 +451,10 @@ src/
     schemas/                 itinerary, saved-itinerary, agent-response
     lib/
       kinde.ts               Identity and permission checks
+      geocoding.ts           Worldwide location resolution, two providers
+      places.ts              OpenStreetMap place discovery
+      discovered-activities.ts  Adapts a place into a plannable candidate
+      activity-context.ts    What discovery offered, for validation
       itinerary-store.ts     Saved itinerary table
       itinerary-validator.ts Deterministic plan validation
       conversations.ts       Threads, stored turns, replay
@@ -389,19 +463,23 @@ src/
       save-intent.ts         Explicit save requirement
       model-key.ts           Per-request OpenAI credential
       weather-conditions.ts  WMO codes, shared with the browser
-  app/                       React SPA
-tests/                       720 tests
+  app/                       React SPA: sidebar, composer, itinerary,
+                             execution panel, account menu
+scripts/
+  build-server.mjs           Vercel build wrapper — see Deploy
+tests/                       776 tests
 ```
 
 ## Tests
 
 ```bash
-npm test         # 720 tests across 29 files
+npm test         # 776 tests across 30 files
 npm run typecheck
 npm run lint
+npm run build    # server bundle, then the frontend
 ```
 
-The test suite requires no Kinde account, no OpenAI key, and no network access. It generates an RSA key pair, serves a JWKS document, and mints signed tokens, so the provider performs real signature verification. Open-Meteo responses are stubbed at the `fetch` boundary and the model is scripted turn by turn, which leaves the tools, the database, the agent, and the authentication pipeline running as they do in production.
+The test suite requires no Kinde account, no OpenAI key, and no network access. It sets `ACTIVITY_SOURCE=seeded` so planning uses the bundled fixtures; discovery itself is tested separately with the providers stubbed at the `fetch` boundary. It generates an RSA key pair, serves a JWKS document, and mints signed tokens, so the provider performs real signature verification. Open-Meteo responses are stubbed at the `fetch` boundary and the model is scripted turn by turn, which leaves the tools, the database, the agent, and the authentication pipeline running as they do in production.
 
 The suite verifies the following behavior, among other cases:
 
@@ -416,12 +494,18 @@ The suite verifies the following behavior, among other cases:
 - A follow-up that returns the previous plan unchanged is detected and reported, not presented as a change.
 - Telemetry carries no prompt, tool argument, tool result, credential, or resource ID.
 - A stored conversation replays as the same cards, with no raw tool data.
+- An arbitrary city resolves and discovers through one path, with no city named in the code.
+- A place nobody discovered is rejected, so the model cannot invent a venue.
+- Unknown opening hours neither disqualify a place nor claim it is open.
+- No provider credential appears in any discovery request.
 
 ## Limitations
 
 The starter kit demonstrates a complete pattern, and several parts stay deliberately small.
 
-The activity dataset is seeded in [`src/mastra/tools/find-activities.ts`](src/mastra/tools/find-activities.ts) and covers Lagos and Lisbon. A request for another city returns no activities, and the agent says so rather than inventing places. The records hold no price or cost information, so the agent cannot rank a day by cost. It reports that limitation instead of estimating prices.
+Activity discovery is worldwide, but OpenStreetMap density varies: a relaxed-afternoon search finds roughly 200 places in London, San Francisco or Tokyo and around 15 to 20 in Lagos or Port Harcourt. Opening hours are recorded for many venues in some regions and few in others, and are treated as unknown when absent. Neither is a defect in the starter kit; it is what the map holds. The source carries no price data, so the agent cannot rank a day by cost and says so instead of estimating.
+
+Discovery is slower in dense cities, because more places match. San Francisco has been measured at about 20 seconds. The deployed function is configured for a 60-second budget, which leaves headroom but cannot guarantee that a slow or busy map server will answer in time.
 
 The model sometimes replies in prose rather than the response schema, which occurs on turns that modify an existing plan. Measured against the live model, this affected about one turn in four before mitigation. The workflow restates the output contract in the prompt and retries up to three times, which removed the failure across 36 measured turns. A run that still fails reports `model_output_invalid`, and the interface offers to try again.
 
@@ -431,13 +515,59 @@ Weather comes from the Open-Meteo daily forecast, which gives one summary for th
 
 ## Deploy
 
-Build both parts with a single command:
+The starter kit deploys to Vercel as **two projects from one repository**. The Mastra backend compiles to a single serverless function whose route table claims every path, so it cannot share a project with the frontend's static files.
 
-```bash
-npm run build      # runs "mastra build --dir src/mastra" and then "vite build"
+| | Frontend | Backend |
+|---|---|---|
+| Project | `mastra-starter-kit` | `mastra-starter-kit-api` |
+| Build command | `npm run build:app` | `npm run build:server` |
+| Output | `dist/app` | Vercel Build Output API (`.vercel/output`) |
+| Framework preset | Vite | Other |
+
+Build settings live in each project's Vercel settings rather than in a `vercel.json`, because a single committed config file would apply to both projects and configure one of them wrongly.
+
+The reference deployment runs at:
+
+- Frontend — `https://kinde-mastra-demo.vercel.app`
+- Backend — `https://mastra-starter-kit-api.vercel.app`
+
+### Environment variables per project
+
+**Backend** (`mastra-starter-kit-api`): `KINDE_DOMAIN`, `KINDE_AUDIENCE`, `DATABASE_URL`, `DATABASE_AUTH_TOKEN`, `APP_ORIGIN`.
+
+**Frontend** (`mastra-starter-kit`): `VITE_KINDE_DOMAIN`, `VITE_KINDE_CLIENT_ID`, `VITE_KINDE_AUDIENCE`, `VITE_MASTRA_URL`.
+
+Three values must agree, or the deployment will not work:
+
+- `VITE_MASTRA_URL` on the frontend must be the deployed **backend** origin. Otherwise the browser calls `http://localhost:4111`.
+- `APP_ORIGIN` on the backend must contain the deployed **frontend** origin, or CORS blocks every request.
+- The Kinde application's callback and logout URLs must use the deployed **frontend** origin, or sign-in fails.
+
+Set `DATABASE_URL` to a hosted LibSQL or Turso database with `DATABASE_AUTH_TOKEN`. A serverless filesystem does not persist, so a `file:` database loses conversations and saved itineraries between invocations.
+
+Leave `ACTIVITY_SOURCE` unset in production so discovery runs for real.
+
+### The build wrapper
+
+[`scripts/build-server.mjs`](scripts/build-server.mjs) exists for one specific reason, and should be removed when that reason goes away.
+
+`@kinde-oss/mastra-auth-kinde` is installed from its official GitHub repository at a pinned commit, because version `0.1.0` is not published to npm. When `mastra build` runs the Vercel deployer, it writes a `package.json` for the generated function and lists each external dependency by the version it reads from the installed package, not by the specifier that installed it. It therefore writes `"0.1.0"`, runs `npm install`, and npm answers 404 — stopping the build before it finishes.
+
+The wrapper lets the bundle complete, rewrites that one dependency back to the Git specifier from `package.json`, runs the install, and performs the two steps the aborted build never reached: writing `.vc-config.json` and moving the output to `.vercel/output`. Both are reproduced from the deployer's own `bundle()`.
+
+Once the package is published to npm, change the dependency to the published version, delete `scripts/build-server.mjs`, and set `build:server` back to `mastra build --dir src/mastra`.
+
+### Function duration
+
+The backend configures the deployer in [`src/mastra/index.ts`](src/mastra/index.ts):
+
+```ts
+deployer: new VercelDeployer({maxDuration: 60})
 ```
 
-The frontend build produces static files that you can host on any static host. The Mastra server runs as a Node service. For a deployment, set the same server-side environment variables, set `DATABASE_URL` to a hosted LibSQL or Turso database instead of a local file, set `APP_ORIGIN` to the origin of the deployed frontend, and register that origin in Kinde as a callback URL and a logout redirect URL.
+A planning run resolves a location and queries a map server before the model turn, and a dense city takes longer. On a default serverless budget the function was killed part-way through, which made every tool in the run appear to fail at once. Sixty seconds leaves room for a slow query; it does not guarantee that every provider request completes.
+
+The wrapper reads this value from the Mastra config when it writes `.vc-config.json`, and fails the build if it is missing.
 
 ## Adapt the starter kit
 

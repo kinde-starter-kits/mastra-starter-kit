@@ -1062,3 +1062,29 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   border-color: var(--border-strong);
   color: var(--text);
 }
+
+/* Three shortcuts for a first visit. Not a list of supported places: any city
+   can be typed into the composer. */
+.destinations-label { text-align: center; margin-top: var(--s-5); }
+
+.destinations {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--s-2);
+  margin-top: var(--s-2);
+}
+
+.destination {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.destination:hover { border-color: var(--border-strong); background: var(--surface-2); }

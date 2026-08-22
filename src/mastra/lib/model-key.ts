@@ -37,41 +37,47 @@ function normalize(value: string | undefined): string | undefined {
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
-/** Where the key used for a request came from. Safe to report to a client. */
-export type ModelKeySource = 'request' | 'server';
+/**
+ * Where the key used for a request came from.
+ *
+ * Only one source exists. The type is kept as a union of one so the wire shape
+ * and the client's handling stay explicit rather than boolean.
+ */
+export type ModelKeySource = 'request';
 
 /**
- * Raised when neither the caller nor the server supplied a key. Carries no
- * key material, and says only which of the two options is missing.
+ * Raised when the caller supplied no key. Carries no key material.
+ *
+ * This is the only outcome when a key is absent: the deployment is strictly
+ * bring-your-own, so there is no server credential to fall back to and no model
+ * call is attempted.
  */
 export class ModelKeyMissingError extends Error {
   readonly code = 'model_key_missing';
   constructor() {
-    super(
-      'No OpenAI API key is available. Add your own key in the app, or set OPENAI_API_KEY on the server.'
-    );
+    super('No OpenAI API key was supplied with this request. Add your own key in the app.');
     this.name = 'ModelKeyMissingError';
   }
 }
 
 /**
- * Resolve the key for this request. A caller-supplied key wins over the
- * server's, so a shared deployment never spends the maintainer's quota when
- * the caller brought their own.
+ * Resolve the key for this request.
+ *
+ * Deliberately the caller's key or nothing. An earlier version fell back to
+ * `process.env.OPENAI_API_KEY`, which meant a shared deployment silently spent
+ * the maintainer's quota for every visitor. The environment variable is now
+ * never read for model access, so setting it cannot re-enable that.
  */
 export function resolveModelKey(): {apiKey: string; source: ModelKeySource} {
   const fromRequest = getRequestModelKey();
   if (fromRequest) return {apiKey: fromRequest, source: 'request'};
 
-  const fromServer = normalize(process.env.OPENAI_API_KEY);
-  if (fromServer) return {apiKey: fromServer, source: 'server'};
-
   throw new ModelKeyMissingError();
 }
 
-/** True when a key is available from either source. Reveals no key material. */
+/** True when the caller supplied a key. Reveals no key material. */
 export function hasModelKey(): boolean {
-  return Boolean(getRequestModelKey() ?? normalize(process.env.OPENAI_API_KEY));
+  return Boolean(getRequestModelKey());
 }
 
 /**
