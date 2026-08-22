@@ -6,7 +6,8 @@ import {
   fetchConversation,
   fetchConversations,
   fetchIdentity,
-  runPlanTrip,
+  PlanCancelledError,
+  streamPlanTrip,
   type ConversationSummary,
   type AgentResponse,
   type Identity
@@ -18,29 +19,67 @@ import {
   writeActiveThreadId
 } from './lib/thread';
 import {FAILURE_TITLES, type FailureKind} from './lib/failure';
-import {AiKeyPanel} from './components/AiKeyPanel';
+import {
+  initialExecutionState,
+  markInterrupted,
+  reduceExecution,
+  startExecution,
+  type ExecutionState
+} from './lib/execution-state';
+import {describeChanges} from '../mastra/lib/itinerary-diff';
+import {ExecutionPanel} from './components/ExecutionPanel';
+import {Sidebar} from './components/Sidebar';
+import {Composer} from './components/Composer';
 import {ItineraryCard} from './components/ItineraryCard';
 import {SavedList} from './components/SavedList';
 import {MessageCard} from './components/MessageCard';
 
-const EXAMPLE = "Plan me an afternoon in Lagos tomorrow. I like outdoor activities and don't want anything too early.";
+/**
+ * Starting points for an empty workspace.
+ *
+ * Each is a request the application genuinely handles: the destination exists
+ * in the activity data, and the constraint — a part of the day, weather, a
+ * meal — is one the planner and validator both understand.
+ */
+const EXAMPLES = [
+  'Plan a relaxed afternoon in Lagos tomorrow.',
+  'Plan a rainy Saturday in Lisbon.',
+  'Give me an evening in Lagos with dinner.'
+];
 
-type Turn = {id: string; request: string; response: AgentResponse};
+/** The wording the server-side intent gate recognises as a request to save. */
+const SAVE_PHRASE = 'Save this itinerary.';
+
+type Turn = {
+  id: string;
+  request: string;
+  response: AgentResponse;
+  /** What the planner did for this turn, kept so history stays inspectable. */
+  execution: ExecutionState;
+  /** Set once this turn's plan has been saved, from the server's own answer. */
+  saved?: boolean;
+};
 
 export function App() {
   const {isLoading, isAuthenticated, user, login, logout, getAccessToken} = useKindeAuth();
 
   const [identity, setIdentity] = useState<Identity | null>(null);
-  const [request, setRequest] = useState(EXAMPLE);
+  const [request, setRequest] = useState('');
   const [turns, setTurns] = useState<Turn[]>([]);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<{message: string; kind: string; detail?: string} | null>(null);
+  const [execution, setExecution] = useState<ExecutionState>(initialExecutionState);
+  // The reducer result is needed synchronously when the run ends, and React
+  // state is not readable there, so the ref mirrors it.
+  const executionRef = useRef<ExecutionState>(initialExecutionState);
+  const abortRef = useRef<AbortController | null>(null);
+  const [error, setError] = useState<
+    {message: string; kind: string; detail?: string; request?: string} | null
+  >(null);
 
   /*
    * The caller's OpenAI key, held in a ref so it lives in memory for this page
-   * session only. It is deliberately not React state persisted anywhere, not
-   * in localStorage, sessionStorage, a cookie, or the URL, and it is never
-   * rendered back to the screen.
+   * session only. It is deliberately not React state persisted anywhere — not
+   * localStorage, sessionStorage, a cookie, or the URL — and never rendered.
    */
   const openaiKey = useRef<string | undefined>(undefined);
   const [hasSessionKey, setHasSessionKey] = useState(false);
@@ -51,15 +90,23 @@ export function App() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | undefined>(undefined);
   const [loadingConversation, setLoadingConversation] = useState(false);
+  const [conversationsFailed, setConversationsFailed] = useState(false);
+  const [search, setSearch] = useState('');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  /** Which turn a save was requested for, so the answer can be attributed. */
+  const savingTurnId = useRef<string | null>(null);
 
   /** Refresh the conversation list from the server, which owns the truth. */
   const refreshConversations = useCallback(async () => {
     try {
       const {conversations: list} = await fetchConversations(await getAccessToken());
       setConversations(list);
+      setConversationsFailed(false);
       return list;
     } catch (err) {
       console.error('[app] could not list conversations', err);
+      setConversationsFailed(true);
       return [];
     }
   }, [getAccessToken]);
@@ -69,14 +116,29 @@ export function App() {
     async (id: string) => {
       setLoadingConversation(true);
       setError(null);
+      setSidebarOpen(false);
       try {
         const detail = await fetchConversation(await getAccessToken(), id);
         threadId.current = detail.threadId;
         setActiveThreadId(detail.threadId);
         writeActiveThreadId(detail.threadId);
-        // Messages come from the server; the transcript is rebuilt from this
-        // conversation rather than from anything cached in the browser.
-        setTurns([]);
+        /*
+         * The transcript is rebuilt from what the server returns, never from
+         * anything cached in the browser — localStorage holds the active thread
+         * id and nothing else. Replayed turns carry no execution telemetry,
+         * because that described a run that is over; the panel renders nothing
+         * for them rather than inventing a timeline.
+         */
+        setTurns(
+          detail.turns.map(turn => ({
+            id: turn.id,
+            request: turn.request,
+            response: turn.response,
+            execution: initialExecutionState
+          }))
+        );
+        executionRef.current = initialExecutionState;
+        setExecution(initialExecutionState);
         setRequest('');
       } catch (err) {
         // A thread that is gone, or was never ours, is not an error state —
@@ -129,31 +191,93 @@ export function App() {
       setBusy(true);
       setError(null);
 
+      const fresh = startExecution();
+      executionRef.current = fresh;
+      setExecution(fresh);
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const savedFor = savingTurnId.current;
+
       try {
         const token = await getAccessToken();
-        const response = await runPlanTrip(
+        const response = await streamPlanTrip(
           token,
           {message: trimmed, threadId: threadId.current},
-          openaiKey.current
+          {
+            openaiKey: openaiKey.current,
+            signal: controller.signal,
+            // Each event is folded in as it arrives, so the timeline reflects
+            // work the server has actually finished — never a guess.
+            onEvent: streamed => {
+              executionRef.current = reduceExecution(executionRef.current, streamed);
+              setExecution(executionRef.current);
+            }
+          }
         );
-        setTurns(previous => [...previous, {id: `${Date.now()}`, request: trimmed, response}]);
+
+        setTurns(previous => {
+          const next = [
+            ...previous,
+            {id: `${Date.now()}`, request: trimmed, response, execution: executionRef.current}
+          ];
+
+          /*
+           * A save is only marked when the server said it happened: the reply
+           * is a message and it is not a permission refusal. The browser never
+           * decides authorization — it reads the answer.
+           */
+          if (savedFor && response.kind === 'message' && !response.permissionDenied) {
+            return next.map(turn => (turn.id === savedFor ? {...turn, saved: true} : turn));
+          }
+          return next;
+        });
+
         setActiveThreadId(threadId.current);
         writeActiveThreadId(threadId.current);
         void refreshConversations();
-        // Clear the box so the natural next step — "Save this itinerary." —
-        // does not require deleting the previous request first.
         setRequest('');
       } catch (err) {
+        if (err instanceof PlanCancelledError) {
+          // The user stopped it. Clear the timeline rather than reporting a
+          // failure they caused deliberately.
+          executionRef.current = initialExecutionState;
+          setExecution(initialExecutionState);
+          return;
+        }
+
+        executionRef.current = markInterrupted(
+          executionRef.current,
+          err instanceof MastraRequestError ? err.kind : 'unknown'
+        );
+        setExecution(executionRef.current);
+
+        // The request stays in the box so a failure never costs the user their
+        // words.
+        setRequest(current => current || trimmed);
+
         setError(
           err instanceof MastraRequestError
-            ? {message: err.message, kind: err.kind, detail: err.detail}
-            : {message: 'Something went wrong. Please try again.', kind: 'unknown'}
+            ? {message: err.message, kind: err.kind, detail: err.detail, request: trimmed}
+            : {message: 'Something went wrong. Please try again.', kind: 'unknown', request: trimmed}
         );
       } finally {
+        savingTurnId.current = null;
+        abortRef.current = null;
         setBusy(false);
       }
     },
     [busy, getAccessToken, refreshConversations]
+  );
+
+  const cancel = useCallback(() => abortRef.current?.abort(), []);
+
+  const saveTurn = useCallback(
+    (id: string) => {
+      savingTurnId.current = id;
+      void send(SAVE_PHRASE);
+    },
+    [send]
   );
 
   const startNewConversation = useCallback(() => {
@@ -161,17 +285,20 @@ export function App() {
     // key stays exactly where it is — in memory for this session.
     threadId.current = newThreadId();
     setTurns([]);
+    executionRef.current = initialExecutionState;
+    setExecution(initialExecutionState);
     setError(null);
-    setRequest(EXAMPLE);
+    setRequest('');
     setActiveThreadId(undefined);
+    setSidebarOpen(false);
     clearActiveThreadId();
   }, []);
 
   if (isLoading) {
     return (
-      <main className="shell">
+      <main className="centered">
         <p className="muted" role="status">
-          Loading…
+          Checking your session…
         </p>
       </main>
     );
@@ -179,7 +306,7 @@ export function App() {
 
   if (!isAuthenticated) {
     return (
-      <main className="shell">
+      <main className="centered">
         <section className="card hero">
           <p className="eyebrow">Mastra × Kinde</p>
           <h1>Plan My Day</h1>
@@ -199,165 +326,200 @@ export function App() {
     );
   }
 
+  const activeTitle =
+    conversations.find(item => item.threadId === activeThreadId)?.title ?? 'New plan';
+
   return (
-    <main className="shell">
-      <header className="topbar">
-        <div className="brand">
-          <span className="dot" aria-hidden="true" />
-          <strong>Plan My Day</strong>
-        </div>
-        <div className="who">
-          <span className="email">{user?.email ?? identity?.sub ?? 'Signed in'}</span>
-          {identity?.orgCode ? <span className="org">{identity.orgCode}</span> : null}
-          <AiKeyPanel
-            keySource={hasSessionKey ? 'request' : (identity?.ai?.keySource ?? null)}
-            hasSessionKey={hasSessionKey}
-            onSave={key => {
-              openaiKey.current = key;
-              setHasSessionKey(true);
-              setError(null);
-            }}
-            onClear={() => {
-              openaiKey.current = undefined;
-              setHasSessionKey(false);
-            }}
-          />
-          <button className="btn ghost small" onClick={() => void logout()}>
-            Sign out
+    <div className="app">
+      <button
+        type="button"
+        className={sidebarOpen ? 'scrim open' : 'scrim'}
+        aria-label="Close navigation"
+        tabIndex={sidebarOpen ? 0 : -1}
+        onClick={() => setSidebarOpen(false)}
+        onKeyDown={event => {
+          if (event.key === 'Escape') setSidebarOpen(false);
+        }}
+      />
+
+      <Sidebar
+        open={sidebarOpen}
+        conversations={conversations}
+        activeThreadId={activeThreadId}
+        loading={loadingConversation && conversations.length === 0}
+        failed={conversationsFailed}
+        search={search}
+        onSearch={setSearch}
+        onSelect={id => void openConversation(id)}
+        onNewPlan={startNewConversation}
+        identity={identity}
+        email={user?.email ?? 'Signed in'}
+        keySource={hasSessionKey ? 'request' : (identity?.ai?.keySource ?? null)}
+        hasSessionKey={hasSessionKey}
+        onSaveKey={key => {
+          openaiKey.current = key;
+          setHasSessionKey(true);
+          setError(null);
+        }}
+        onClearKey={() => {
+          openaiKey.current = undefined;
+          setHasSessionKey(false);
+        }}
+        onSignOut={() => void logout()}
+      />
+
+      <div className="workspace">
+        <header className="workspace-head">
+          <button
+            type="button"
+            className="btn quiet small sidebar-toggle"
+            aria-label="Show conversations"
+            aria-expanded={sidebarOpen}
+            onClick={() => setSidebarOpen(value => !value)}
+          >
+            <span aria-hidden="true">☰</span>
           </button>
-        </div>
-      </header>
+          <span className="workspace-title">{activeTitle}</span>
+        </header>
 
-      {identity?.claimWarnings.length ? (
-        <section className="card warn" role="status">
-          <h2>Kinde setup incomplete</h2>
-          <ul>
-            {identity.claimWarnings.map(warning => (
-              <li key={warning}>{warning}</li>
+        <div className="workspace-scroll">
+          <div className="thread">
+            {identity?.claimWarnings.length ? (
+              <section className="card warn" role="status">
+                <h2>Kinde setup incomplete</h2>
+                <ul>
+                  {identity.claimWarnings.map(warning => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+
+            {turns.length === 0 && !busy && !error ? (
+              <div className="empty-state">
+                <h2>What&apos;s the plan?</h2>
+                <p>
+                  Describe the day you want. The planner checks the real forecast, finds activities
+                  that fit, and builds an itinerary you can save.
+                </p>
+                {/* Real requests, not decoration: each one names a city the
+                    activity data covers and a constraint the planner honours. */}
+                <ul className="examples">
+                  {EXAMPLES.map(example => (
+                    <li key={example}>
+                      <button
+                        type="button"
+                        className="example"
+                        onClick={() => setRequest(example)}
+                      >
+                        {example}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            {turns.map((turn, index) => (
+              <section key={turn.id} className="turn">
+                <p className="asked">{turn.request}</p>
+                <ExecutionPanel state={turn.execution} />
+                {/* Derived by comparing the two structured plans, so it can only
+                    ever describe differences that genuinely exist. */}
+                <ChangeSummary changes={changesFor(turns, index)} />
+                <ResponseView
+                  response={turn.response}
+                  saved={turn.saved}
+                  saving={busy && savingTurnId.current === turn.id}
+                  onSave={() => saveTurn(turn.id)}
+                />
+              </section>
             ))}
-          </ul>
-        </section>
-      ) : null}
 
-      <section className="card composer">
-        <h1>What&apos;s the plan?</h1>
-        <p className="muted">
-          Describe the day you want. The agent checks the weather, finds activities, and builds an
-          itinerary. Ask it to <em>save this itinerary</em> once you like it.
-        </p>
+            {busy || execution.status === 'failed' ? (
+              <ExecutionPanel state={execution} onCancel={cancel} />
+            ) : null}
 
-        <form
-          onSubmit={event => {
-            event.preventDefault();
-            void send(request);
-          }}
-        >
-          <label className="sr-only" htmlFor="request">
-            Your request
-          </label>
-          <textarea
-            id="request"
-            rows={3}
-            value={request}
-            disabled={busy}
-            onChange={event => setRequest(event.target.value)}
-            placeholder={EXAMPLE}
-          />
-
-          <div className="actions">
-            <button className="btn" type="submit" disabled={busy || request.trim().length === 0}>
-              {busy ? 'Planning…' : 'Plan my day'}
-            </button>
-            {turns.length > 0 ? (
-              <button className="btn ghost" type="button" onClick={startNewConversation}>
-                New conversation
-              </button>
+            {error ? (
+              <ErrorPanel
+                error={error}
+                busy={busy}
+                onRetry={error.request ? () => void send(error.request as string) : undefined}
+              />
             ) : null}
           </div>
-        </form>
-
-        {identity ? (
-          <p className="perms">
-            <PermissionPill ok={identity.can.readItinerary} label="read:itinerary" />
-            <PermissionPill ok={identity.can.createItinerary} label="create:itinerary" />
-          </p>
-        ) : null}
-      </section>
-
-      <section className="card conversations" aria-label="Recent conversations">
-        <div className="conversations-head">
-          <h2>Recent conversations</h2>
-          <button className="btn ghost small" type="button" onClick={startNewConversation}>
-            + New conversation
-          </button>
         </div>
 
-        {loadingConversation ? (
-          <p className="muted small" role="status">
-            Loading conversation…
-          </p>
-        ) : conversations.length === 0 ? (
-          <p className="muted small">No conversations yet. Send a request to start one.</p>
-        ) : (
-          <ul className="conversation-list">
-            {conversations.map(conversation => (
-              <li key={conversation.threadId}>
-                <button
-                  type="button"
-                  className={
-                    conversation.threadId === activeThreadId
-                      ? 'conversation-item active'
-                      : 'conversation-item'
-                  }
-                  aria-current={conversation.threadId === activeThreadId ? 'true' : undefined}
-                  onClick={() => void openConversation(conversation.threadId)}
-                >
-                  <span className="conversation-title">{conversation.title}</span>
-                  <span className="conversation-time">
-                    {new Date(conversation.updatedAt).toLocaleString(undefined, {
-                      day: 'numeric',
-                      month: 'short',
-                      hour: '2-digit',
-                      minute: '2-digit'
-                    })}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      {error ? <ErrorPanel error={error} /> : null}
-
-      {busy ? (
-        <section className="card loading" role="status" aria-live="polite">
-          <span className="spinner" aria-hidden="true" />
-          <span>Checking the weather and finding activities…</span>
-        </section>
-      ) : null}
-
-      {turns.length === 0 && !busy && !error ? (
-        <section className="card empty">
-          <h2>Nothing planned yet</h2>
-          <p className="muted">Send a request above to get started.</p>
-        </section>
-      ) : null}
-
-      {[...turns].reverse().map(turn => (
-        <section key={turn.id} className="turn">
-          <p className="asked">“{turn.request}”</p>
-          <ResponseView response={turn.response} />
-        </section>
-      ))}
-    </main>
+        <Composer
+          value={request}
+          onChange={setRequest}
+          onSubmit={() => void send(request)}
+          onCancel={cancel}
+          busy={busy}
+          canCancel={Boolean(abortRef.current)}
+          showHints={turns.length > 0}
+        />
+      </div>
+    </div>
   );
 }
 
-function ResponseView({response}: {response: AgentResponse}) {
+/**
+ * What changed between this plan and the one before it.
+ *
+ * Computed from the two structured itineraries rather than asked of the model,
+ * which is the only way a summary can be trusted: if the plans are effectively
+ * the same, there is nothing to list and nothing is shown.
+ */
+function changesFor(turns: Turn[], index: number): string[] {
+  const current = turns[index]?.response;
+  if (current?.kind !== 'itinerary') return [];
+
+  for (let previous = index - 1; previous >= 0; previous -= 1) {
+    const earlier = turns[previous].response;
+    if (earlier.kind !== 'itinerary') continue;
+    return describeChanges(earlier.itinerary, current.itinerary);
+  }
+
+  return [];
+}
+
+function ChangeSummary({changes}: {changes: string[]}) {
+  if (changes.length === 0) return null;
+
+  return (
+    <div className="change-summary">
+      <p className="change-summary-title">Updated your plan</p>
+      <ul>
+        {changes.map(change => (
+          <li key={change}>{change}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ResponseView({
+  response,
+  onSave,
+  saved,
+  saving
+}: {
+  response: AgentResponse;
+  onSave?: () => void;
+  saved?: boolean;
+  saving?: boolean;
+}) {
   switch (response.kind) {
     case 'itinerary':
-      return <ItineraryCard itinerary={response.itinerary} />;
+      return (
+        <ItineraryCard
+          itinerary={response.itinerary}
+          onSave={onSave}
+          saved={saved}
+          saving={saving}
+        />
+      );
     case 'saved-list':
       return <SavedList itineraries={response.itineraries} />;
     case 'message':
@@ -373,33 +535,42 @@ function ResponseView({response}: {response: AgentResponse}) {
   }
 }
 
-function ErrorPanel({error}: {error: {message: string; kind: string; detail?: string}}) {
+function ErrorPanel({
+  error,
+  onRetry,
+  busy
+}: {
+  error: {message: string; kind: string; detail?: string};
+  onRetry?: () => void;
+  busy?: boolean;
+}) {
   const [showDetail, setShowDetail] = useState(false);
 
   return (
     <section className="card error" role="alert">
       <h2>{FAILURE_TITLES[error.kind as FailureKind] ?? FAILURE_TITLES.unknown}</h2>
-      <p>{error.message}</p>
-      {error.detail ? (
-        <>
+      <p className="small muted">{error.message}</p>
+
+      <div className="error-actions">
+        {/* Offered for anything worth another attempt. A transient model
+            formatting slip is the common case and usually succeeds again. */}
+        {onRetry ? (
+          <button type="button" className="btn small" onClick={onRetry} disabled={busy}>
+            Try again
+          </button>
+        ) : null}
+        {error.detail ? (
           <button
             type="button"
-            className="btn ghost small"
+            className="btn quiet small"
             onClick={() => setShowDetail(value => !value)}
           >
             {showDetail ? 'Hide details' : 'Show details'}
           </button>
-          {showDetail ? <pre className="error-detail">{error.detail}</pre> : null}
-        </>
-      ) : null}
-    </section>
-  );
-}
+        ) : null}
+      </div>
 
-function PermissionPill({ok, label}: {ok: boolean; label: string}) {
-  return (
-    <span className={ok ? 'pill yes' : 'pill no'}>
-      <span aria-hidden="true">{ok ? '✓' : '✕'}</span> {label}
-    </span>
+      {showDetail && error.detail ? <pre className="error-detail">{error.detail}</pre> : null}
+    </section>
   );
 }

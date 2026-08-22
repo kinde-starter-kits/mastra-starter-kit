@@ -17,6 +17,11 @@ When you ask the agent to plan an afternoon, it reads the weather forecast, sele
 | Agent | One agent with four tools and multi-step tool calling |
 | Structured output | A discriminated-union response envelope that the frontend renders directly |
 | Workflow | A typed `plan-trip` workflow that acts as the entry point |
+| Validation | A deterministic itinerary validator, with one correction attempt before the run fails |
+| Follow-ups | A later message edits the plan already in the conversation, using the stored structured itinerary |
+| Telemetry | Execution events streamed to the browser over the workflow stream |
+| Conversation replay | Validated responses stored on the Mastra thread, so a reopened conversation renders the original cards |
+| Model access | A caller-supplied OpenAI key per request, falling back to the server key |
 | Frontend | A React and Vite single-page application |
 
 ### The identity model
@@ -161,7 +166,7 @@ Do not set a relative path such as `file:./mastra.db`, because that reintroduces
 
 The agent needs an OpenAI API key, and the starter kit accepts one from either of two sources.
 
-**A key that the user supplies.** Sign in, open the **AI: OpenAI** control in the header, and enter a key. The application keeps that key in memory for the current page session and sends it with each planning request. Bring your own OpenAI API key so that the demo does not require the project maintainer to provide model access, and so that model usage is charged to your own OpenAI account.
+**A key that the user supplies.** Sign in, open the account menu at the foot of the sidebar, and select **Add key**. The application keeps that key in memory for the current page session and sends it with each planning request. Bring your own OpenAI API key so that the demo does not require the project maintainer to provide model access, and so that model usage is charged to your own OpenAI account.
 
 **A key that the server provides.** Set `OPENAI_API_KEY` in the server environment. This suits a private or self-hosted deployment. The value is never sent to the browser.
 
@@ -329,12 +334,19 @@ Now sign in as the Viewer user and repeat both requests. The agent still produce
 
 ## HTTP API
 
-The frontend calls two endpoints on the Mastra server. Both require a valid bearer token.
+The frontend calls these endpoints on the Mastra server. Every one requires a valid bearer token, and every one returns `401` without it.
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/me` | Returns the identity that the server derived from the token, including `sub`, `orgCode`, `permissions`, `resourceId`, and `claimWarnings`. |
-| `POST` | `/api/workflows/planTripWorkflow/start-async` | Runs the `plan-trip` workflow to completion and returns an `AgentResponse`. The request body is `{ "inputData": { "message": "...", "threadId": "..." } }`. |
+| `GET` | `/conversations` | Lists the caller's conversations. Ownership comes from the token, never from the request. |
+| `GET` | `/conversations/:threadId` | Returns one conversation, rebuilt as turns. A thread that is missing and a thread that belongs to somebody else give the same `404`. |
+| `POST` | `/api/workflows/planTripWorkflow/stream?runId=<uuid>` | Runs the workflow and streams execution events while it works. The `runId` query parameter is required. |
+| `POST` | `/api/workflows/planTripWorkflow/start-async` | Runs the workflow to completion in one response. Used as a fallback when the environment cannot read a stream. |
+
+The stream is a sequence of JSON records separated by `\x1e` (RFC 7464), not newline-delimited JSON. The wire format is captured in `tests/fixtures/` and decoded in [`src/app/lib/stream-protocol.ts`](src/app/lib/stream-protocol.ts).
+
+A caller may send an OpenAI key in the `x-openai-api-key` header. The key is held in browser memory for the session, sent as a header on each request, and read on the server through `AsyncLocalStorage`. It never enters workflow input, telemetry, conversation metadata, or storage.
 
 ## Response contract
 
@@ -365,16 +377,26 @@ src/
       save-itinerary.ts      Requires create:itinerary
       list-itineraries.ts    Requires read:itinerary
     workflows/plan-trip.ts   Typed workflow entry point
+    telemetry/plan-events.ts Execution event contract
     schemas/                 itinerary, saved-itinerary, agent-response
-    lib/                     kinde identity and permissions, itinerary-store, database-url
+    lib/
+      kinde.ts               Identity and permission checks
+      itinerary-store.ts     Saved itinerary table
+      itinerary-validator.ts Deterministic plan validation
+      conversations.ts       Threads, stored turns, replay
+      follow-up.ts           Follow-up classification and patch prompts
+      itinerary-diff.ts      Deterministic change detection
+      save-intent.ts         Explicit save requirement
+      model-key.ts           Per-request OpenAI credential
+      weather-conditions.ts  WMO codes, shared with the browser
   app/                       React SPA
-tests/                       264 tests
+tests/                       720 tests
 ```
 
 ## Tests
 
 ```bash
-npm test         # 264 tests across 14 files
+npm test         # 720 tests across 29 files
 npm run typecheck
 npm run lint
 ```
@@ -389,6 +411,23 @@ The suite verifies the following behavior, among other cases:
 - A save without `create:itinerary` is refused and writes no record.
 - One user cannot read another user's itineraries, in the same organization or in a different organization.
 - The weather forecast affects activity selection.
+- An itinerary that breaks the requested time window, opening hours, or the weather policy is rejected.
+- A plan is never saved unless the message asked for it, whatever the model decides.
+- A follow-up that returns the previous plan unchanged is detected and reported, not presented as a change.
+- Telemetry carries no prompt, tool argument, tool result, credential, or resource ID.
+- A stored conversation replays as the same cards, with no raw tool data.
+
+## Limitations
+
+The starter kit demonstrates a complete pattern, and several parts stay deliberately small.
+
+The activity dataset is seeded in [`src/mastra/tools/find-activities.ts`](src/mastra/tools/find-activities.ts) and covers Lagos and Lisbon. A request for another city returns no activities, and the agent says so rather than inventing places. The records hold no price or cost information, so the agent cannot rank a day by cost. It reports that limitation instead of estimating prices.
+
+The model sometimes replies in prose rather than the response schema, which occurs on turns that modify an existing plan. Measured against the live model, this affected about one turn in four before mitigation. The workflow restates the output contract in the prompt and retries up to three times, which removed the failure across 36 measured turns. A run that still fails reports `model_output_invalid`, and the interface offers to try again.
+
+A follow-up that names a measurable change, such as fewer stops or a later start, is checked against the previous plan. A request with no single measure, such as "make it more relaxed", relies on the model and the validator. The change detection compares the schedule rather than the prose, so an edit that changes only the notes reads as no change.
+
+Weather comes from the Open-Meteo daily forecast, which gives one summary for the whole day rather than hourly detail. Dates resolve in UTC, so a traveller several time zones from UTC can see "today" change early or late.
 
 ## Deploy
 

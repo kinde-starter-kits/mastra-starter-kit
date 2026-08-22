@@ -171,7 +171,7 @@ describe('loading', () => {
     });
 
     expect(detail.threadId).toBe('load-mine');
-    expect(Array.isArray(detail.messages)).toBe(true);
+    expect(Array.isArray(detail.turns)).toBe(true);
   });
 
   it('refuses an unknown thread', async () => {

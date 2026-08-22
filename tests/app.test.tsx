@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import {describe, it, expect, vi, beforeEach, afterEach} from 'vitest';
-import {render, screen, waitFor, cleanup} from '@testing-library/react';
+import {act, render, screen, waitFor, cleanup} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import type {AgentResponse} from '../src/mastra/schemas/agent-response.js';
@@ -31,7 +31,8 @@ vi.mock('../src/app/lib/mastra-client', async () => {
   );
   return {
     ...actual,
-    runPlanTrip: (...args: unknown[]) => runPlanTrip(...args),
+    // The app streams; the double stands in for the streaming call.
+    streamPlanTrip: (...args: unknown[]) => runPlanTrip(...args),
     fetchIdentity: (...args: unknown[]) => fetchIdentity(...args),
     fetchConversations: (...args: unknown[]) => fetchConversations(...args),
     fetchConversation: (...args: unknown[]) => fetchConversation(...args)
@@ -101,7 +102,7 @@ beforeEach(() => {
   fetchConversation.mockResolvedValue({
     threadId: 'thread-1', title: 'Lagos Afternoon',
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    messages: []
+    turns: []
   });
   localStorage.clear();
 });
@@ -109,14 +110,12 @@ beforeEach(() => {
 afterEach(cleanup);
 
 /** Submit the planning form and wait for the request to be issued. */
-async function plan(message?: string) {
+async function plan(message = 'Plan me an afternoon in Lagos.') {
   const user = userEvent.setup();
   const box = screen.getByLabelText(/your request/i);
-  if (message !== undefined) {
-    await user.clear(box);
-    await user.type(box, message);
-  }
-  await user.click(screen.getByRole('button', {name: /plan my day/i}));
+  await user.clear(box);
+  await user.type(box, message);
+  await user.click(screen.getByRole('button', {name: /send request/i}));
   return user;
 }
 
@@ -135,15 +134,21 @@ describe('unauthenticated', () => {
     auth.isLoading = true;
     render(<App />);
 
-    expect(screen.getByRole('status').textContent).toMatch(/loading/i);
+    expect(screen.getByRole('status').textContent).toMatch(/checking your session/i);
   });
 });
 
 describe('authenticated planning', () => {
-  it('shows identity and organization', async () => {
+  it('shows who is signed in without exposing scoping internals', async () => {
     render(<App />);
-    await waitFor(() => expect(screen.getByText('org_alpha')).toBeDefined());
-    expect(screen.getByText('alice@example.com')).toBeDefined();
+    await waitFor(() => expect(screen.getByText('alice@example.com')).toBeDefined());
+
+    // org_code, sub, resource id and permission arrays are how the server
+    // scopes data; none of them belong on screen.
+    const shown = document.body.textContent ?? '';
+    expect(shown).not.toContain('org_alpha');
+    expect(shown).not.toContain('kp:user_alice');
+    expect(shown).not.toContain('org_alpha:kp:user_alice');
   });
 
   it('sends the request to the workflow with a thread id and no identity fields', async () => {
@@ -161,20 +166,74 @@ describe('authenticated planning', () => {
     expect(input).not.toHaveProperty('orgCode');
   });
 
-  it('shows a loading state while the workflow runs', async () => {
+  it('reports progress from real events rather than a fixed message', async () => {
+    // Before any telemetry arrives there is nothing to claim, so the panel says
+    // only that work is happening. Each stage shown afterwards comes from an
+    // event the server actually emitted.
     let release: (value: AgentResponse) => void = () => {};
-    runPlanTrip.mockReturnValue(new Promise<AgentResponse>(resolve => (release = resolve)));
+    let emit: (event: unknown) => void = () => {};
+
+    runPlanTrip.mockImplementation(
+      (_token: unknown, _input: unknown, options: {onEvent?: (event: unknown) => void}) => {
+        emit = options.onEvent ?? (() => {});
+        return new Promise<AgentResponse>(resolve => (release = resolve));
+      }
+    );
 
     render(<App />);
     await plan('Plan something.');
 
+    await waitFor(() => expect(screen.getByRole('status').textContent).toMatch(/working/i));
+    expect(screen.getByRole('button', {name: /send request/i}).hasAttribute('disabled')).toBe(true);
+
+    act(() =>
+      emit({
+        type: 'stage_started',
+        marker: 'plan-execution-event',
+        stage: 'weather',
+        timestamp: '2026-08-21T10:00:00.000Z'
+      })
+    );
     await waitFor(() =>
       expect(screen.getByRole('status').textContent).toMatch(/checking the weather/i)
     );
-    expect(screen.getByRole('button', {name: /planning/i})).toBeDefined();
 
     release(itineraryResponse);
-    await waitFor(() => expect(screen.queryByText(/checking the weather/i)).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('button', {name: /cancel/i})).toBeNull());
+  });
+
+  it('shows a tool call only once the server reports it finished', async () => {
+    let release: (value: AgentResponse) => void = () => {};
+    let emit: (event: unknown) => void = () => {};
+
+    runPlanTrip.mockImplementation(
+      (_token: unknown, _input: unknown, options: {onEvent?: (event: unknown) => void}) => {
+        emit = options.onEvent ?? (() => {});
+        return new Promise<AgentResponse>(resolve => (release = resolve));
+      }
+    );
+
+    render(<App />);
+    await plan('Plan something.');
+    await waitFor(() => expect(screen.getByRole('status')).toBeDefined());
+
+    act(() =>
+      emit({
+        type: 'tool_completed',
+        marker: 'plan-execution-event',
+        tool: 'get-weather',
+        durationMs: 1200,
+        weather: {location: 'Lagos', date: '2026-08-22', condition: 'Sunny'},
+        timestamp: '2026-08-21T10:00:01.000Z'
+      })
+    );
+
+    await waitFor(() => expect(screen.getByText(/weather lookup/i)).toBeDefined());
+    // The measured duration is reported, not an estimate.
+    expect(screen.getByText('1.2s')).toBeDefined();
+    expect(screen.getByText(/Lagos · Sunny/)).toBeDefined();
+
+    release(itineraryResponse);
   });
 });
 
@@ -189,10 +248,10 @@ describe('itinerary rendering', () => {
     expect(screen.getByText('Moderate drizzle')).toBeDefined();
 
     // High/low rounded, plus precipitation probability.
-    const weather = document.querySelector('.weather')?.textContent ?? '';
-    expect(weather).toContain('27°');
-    expect(weather).toContain('25°');
+    const weather = document.querySelector('.weather-strip')?.textContent ?? '';
+    expect(weather).toContain('25–27');
     expect(weather).toContain('100%');
+    expect(weather).toContain('Moderate drizzle');
     expect(screen.getByText(/indoor stop scheduled/i)).toBeDefined();
     expect(screen.getByText(/carry a light rain jacket/i)).toBeDefined();
 
@@ -212,8 +271,13 @@ describe('itinerary rendering', () => {
     expect(names[0]).toContain('Nike Art Gallery');
     expect(names[1]).toContain('Dinner at Yellow Chilli');
 
-    expect(screen.getAllByText('1 hr 30 min')).toHaveLength(2);
-    expect(screen.getByText('Lekki, Lagos')).toBeDefined();
+    expect(screen.getAllByText('1h 30m')).toHaveLength(2);
+    // Category and location share one line: "Culture · Lekki, Lagos".
+    expect(
+      Array.from(document.querySelectorAll('.activity-where')).some(node =>
+        node.textContent?.includes('Lekki, Lagos')
+      )
+    ).toBe(true);
   });
 });
 
@@ -238,7 +302,7 @@ describe('saved-list rendering', () => {
     const user = await plan('Show me my saved itineraries.');
 
     await waitFor(() => expect(screen.getByText(/1 saved itinerary/i)).toBeDefined());
-    expect(screen.getByText('2026-08-22')).toBeDefined();
+    expect(document.querySelector('.saved-row')?.textContent).toContain('2026-08-22');
 
     // Details are collapsed until asked for.
     expect(screen.queryByText('Moderate drizzle')).toBeNull();
@@ -310,16 +374,16 @@ describe('permission denied', () => {
     expect(document.querySelector('.card.denied')).toBeNull();
   });
 
-  it('surfaces the permissions the user actually holds', async () => {
+  it('does not put the permission array on screen', async () => {
+    // Permissions scope data on the server. Rendering them turned an ordinary
+    // product surface into a debugging view, so the UI no longer shows them —
+    // a refusal is surfaced when an action is actually attempted.
     render(<App />);
-    await waitFor(() => expect(document.querySelector('.perms')).not.toBeNull());
+    await waitFor(() => expect(screen.getByText('alice@example.com')).toBeDefined());
 
-    const pills = Array.from(document.querySelectorAll('.perms .pill'));
-    const read = pills.find(p => p.textContent?.includes('read:itinerary'));
-    const create = pills.find(p => p.textContent?.includes('create:itinerary'));
-
-    expect(read?.className).toContain('yes');
-    expect(create?.className).toContain('no');
+    const shown = document.body.textContent ?? '';
+    expect(shown).not.toContain('read:itinerary');
+    expect(shown).not.toContain('create:itinerary');
   });
 });
 
@@ -347,6 +411,169 @@ describe('errors', () => {
   });
 });
 
+describe('conversation replay', () => {
+  const CONVERSATIONS = [
+    {threadId: 'thread-lagos', title: 'Lagos Afternoon', createdAt: '2026-08-20T10:00:00.000Z', updatedAt: '2026-08-21T10:00:00.000Z'},
+    {threadId: 'thread-lisbon', title: 'Lisbon Weekend', createdAt: '2026-08-19T10:00:00.000Z', updatedAt: '2026-08-20T10:00:00.000Z'}
+  ];
+
+  const LAGOS_TURNS = [
+    {
+      id: '1',
+      request: 'Plan me an afternoon in Lagos tomorrow.',
+      response: itineraryResponse
+    },
+    {
+      id: '2',
+      request: 'Make it more relaxed.',
+      response: {
+        kind: 'message',
+        message: 'I relaxed the pace.',
+        permissionDenied: false,
+        requiredPermission: null
+      } as AgentResponse
+    }
+  ];
+
+  it('rebuilds previous turns as the same cards a live run renders', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: LAGOS_TURNS});
+
+    render(<App />);
+
+    // The request and the itinerary card both come back, not raw JSON.
+    await waitFor(() =>
+      expect(screen.getByText(/Plan me an afternoon in Lagos tomorrow\./)).toBeDefined()
+    );
+    expect(screen.getByText('I relaxed the pace.')).toBeDefined();
+    expect(document.body.textContent).not.toContain('"kind"');
+  });
+
+  it('shows no execution timeline for a replayed turn', async () => {
+    // The run is over; inventing a timeline for it would be fiction.
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: LAGOS_TURNS});
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('I relaxed the pace.')).toBeDefined());
+
+    expect(document.querySelector('.execution')).toBeNull();
+  });
+
+  it('replaces the transcript when switching conversations', async () => {
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: LAGOS_TURNS});
+
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Lisbon Weekend')).toBeDefined());
+
+    fetchConversation.mockResolvedValue({
+      ...CONVERSATIONS[1],
+      turns: [
+        {
+          id: '9',
+          request: 'Plan a relaxed afternoon in Lisbon.',
+          response: {
+            kind: 'message',
+            message: 'Here is Lisbon.',
+            permissionDenied: false,
+            requiredPermission: null
+          } as AgentResponse
+        }
+      ]
+    });
+
+    await user.click(screen.getByText('Lisbon Weekend'));
+    await waitFor(() => expect(screen.getByText('Here is Lisbon.')).toBeDefined());
+    expect(screen.queryByText('I relaxed the pace.')).toBeNull();
+  });
+
+  it('continues a resumed conversation on its own thread', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: LAGOS_TURNS});
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('I relaxed the pace.')).toBeDefined());
+
+    await plan('Start later.');
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
+
+    const [, input] = runPlanTrip.mock.calls.at(-1) as [unknown, {threadId: string}];
+    expect(input.threadId).toBe('thread-lagos');
+  });
+
+  it('appends a new turn to the replayed ones rather than replacing them', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: LAGOS_TURNS});
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('I relaxed the pace.')).toBeDefined());
+
+    await plan('Start later.');
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
+
+    await waitFor(() => expect(screen.getByText(/Start later\./)).toBeDefined());
+    expect(screen.getByText('I relaxed the pace.')).toBeDefined();
+  });
+
+  it('clears replayed turns when a new conversation starts', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: LAGOS_TURNS});
+
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('I relaxed the pace.')).toBeDefined());
+
+    // Two controls offer this; either starts a fresh thread.
+    await user.click(screen.getAllByRole('button', {name: /new plan/i})[0]);
+
+    expect(screen.queryByText('I relaxed the pace.')).toBeNull();
+    expect(localStorage.getItem('planmyday.activeThreadId')).toBeNull();
+  });
+
+  it('keeps no conversation content in browser storage', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: LAGOS_TURNS});
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('I relaxed the pace.')).toBeDefined());
+
+    // Only the active thread id is ever persisted.
+    expect(Object.keys(localStorage)).toEqual(['planmyday.activeThreadId']);
+    const stored = JSON.stringify(localStorage) + JSON.stringify(sessionStorage);
+    expect(stored).not.toContain('I relaxed the pace.');
+    expect(stored).not.toContain('Lagos Afternoon');
+  });
+
+  it('does not carry a model key into replay', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: LAGOS_TURNS});
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
+    await user.click(screen.getByRole('button', {name: /add key/i}));
+    await user.type(screen.getByLabelText(/api key/i), 'sk-replay-probe');
+    await user.click(screen.getByRole('button', {name: /save key/i}));
+
+    await waitFor(() => expect(screen.getByText('I relaxed the pace.')).toBeDefined());
+
+    // The key is a header on live calls; replay must not surface it anywhere.
+    expect(document.body.textContent).not.toContain('sk-replay-probe');
+    expect(JSON.stringify(localStorage) + JSON.stringify(sessionStorage)).not.toContain('sk-replay-probe');
+    const replayCall = fetchConversation.mock.calls.at(-1) as unknown[];
+    expect(JSON.stringify(replayCall)).not.toContain('sk-replay-probe');
+  });
+});
+
 describe('conversation persistence wiring', () => {
   const CONVERSATIONS = [
     {threadId: 'thread-lagos', title: 'Lagos Afternoon', createdAt: '2026-08-20T10:00:00.000Z', updatedAt: '2026-08-21T10:00:00.000Z'},
@@ -363,12 +590,12 @@ describe('conversation persistence wiring', () => {
 
   it('shows an empty state when there are none', async () => {
     render(<App />);
-    await waitFor(() => expect(screen.getByText(/no conversations yet/i)).toBeDefined());
+    await waitFor(() => expect(screen.getByText(/no plans yet/i)).toBeDefined());
   });
 
   it('loads the conversation the user clicks', async () => {
     fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
-    fetchConversation.mockResolvedValue({...CONVERSATIONS[1], messages: []});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[1], turns: []});
 
     const user = userEvent.setup();
     render(<App />);
@@ -384,7 +611,7 @@ describe('conversation persistence wiring', () => {
   it('restores the remembered thread on startup when it belongs to the user', async () => {
     localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
     fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
-    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], messages: []});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: []});
 
     render(<App />);
     await waitFor(() => expect(fetchConversation).toHaveBeenCalled());
@@ -443,10 +670,10 @@ describe('conversation persistence wiring', () => {
     await plan('Plan me an afternoon in Lagos.');
     await waitFor(() => expect(screen.getByText('Lagos')).toBeDefined());
 
-    const panelNew = screen.getByRole('button', {name: /\+ new conversation/i});
+    const panelNew = screen.getByRole('button', {name: /new plan/i});
     await user.click(panelNew);
 
-    await waitFor(() => expect(screen.getByText(/nothing planned yet/i)).toBeDefined());
+    await waitFor(() => expect(screen.getByText(/what's the plan/i)).toBeDefined());
     expect(localStorage.getItem('planmyday.activeThreadId')).toBeNull();
     // Existing conversations are untouched.
     expect(screen.getByText('Lagos Afternoon')).toBeDefined();
@@ -478,10 +705,13 @@ describe('composer behaviour', () => {
 });
 
 describe('AI key control (BYOK)', () => {
-  it('prompts for a key when neither a session nor a server key exists', async () => {
+  it('offers a key when neither a session nor a server key exists', async () => {
+    const user = userEvent.setup();
     render(<App />);
-    await waitFor(() => expect(screen.getByRole('button', {name: /AI: OpenAI/i})).toBeDefined());
-    expect(screen.getByRole('button', {name: /add api key/i})).toBeDefined();
+
+    await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
+    expect(screen.getByRole('button', {name: /add key/i})).toBeDefined();
+    expect(screen.getByText(/no key configured/i)).toBeDefined();
   });
 
   it('reports a server-configured key without revealing it', async () => {
@@ -490,8 +720,12 @@ describe('AI key control (BYOK)', () => {
       ai: {provider: 'openai', keySource: 'server'}
     });
 
+    const user = userEvent.setup();
     render(<App />);
-    await waitFor(() => expect(screen.getByText(/server configured/i)).toBeDefined());
+
+    await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
+    await waitFor(() => expect(screen.getByText(/using server key/i)).toBeDefined());
+    // The server's own key is never rendered, only the fact that one exists.
     expect(document.body.textContent).not.toMatch(/sk-/);
   });
 
@@ -499,7 +733,8 @@ describe('AI key control (BYOK)', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', {name: /AI: OpenAI/i}));
+    await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
+    await user.click(screen.getByRole('button', {name: /add key/i}));
     const input = screen.getByLabelText(/api key/i) as HTMLInputElement;
     expect(input.type).toBe('password');
 
@@ -513,9 +748,13 @@ describe('AI key control (BYOK)', () => {
     await plan('Plan me a day.');
     await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
 
-    // Passed as the third argument (the header value), not inside the body.
-    const call = runPlanTrip.mock.calls.at(-1) as [string, Record<string, unknown>, string];
-    expect(call[2]).toBe('sk-my-secret-test-key');
+    // Passed as an option (it becomes a header), never inside the request body.
+    const call = runPlanTrip.mock.calls.at(-1) as [
+      string,
+      Record<string, unknown>,
+      {openaiKey?: string}
+    ];
+    expect(call[2].openaiKey).toBe('sk-my-secret-test-key');
     expect(JSON.stringify(call[1])).not.toContain('sk-my-secret-test-key');
   });
 
@@ -523,7 +762,8 @@ describe('AI key control (BYOK)', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', {name: /AI: OpenAI/i}));
+    await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
+    await user.click(screen.getByRole('button', {name: /add key/i}));
     await user.type(screen.getByLabelText(/api key/i), 'sk-storage-probe');
     await user.click(screen.getByRole('button', {name: /save key/i}));
     await waitFor(() => expect(screen.getByText(/using your key/i)).toBeDefined());
@@ -538,19 +778,20 @@ describe('AI key control (BYOK)', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', {name: /AI: OpenAI/i}));
+    await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
+    await user.click(screen.getByRole('button', {name: /add key/i}));
     await user.type(screen.getByLabelText(/api key/i), 'sk-to-be-cleared');
     await user.click(screen.getByRole('button', {name: /save key/i}));
     await waitFor(() => expect(screen.getByText(/using your key/i)).toBeDefined());
 
-    await user.click(screen.getByRole('button', {name: /AI: OpenAI/i}));
+    // The menu is still open from saving the key.
     await user.click(screen.getByRole('button', {name: /clear key/i}));
-    await waitFor(() => expect(screen.getByRole('button', {name: /add api key/i})).toBeDefined());
+    await waitFor(() => expect(screen.getByRole('button', {name: /add key/i})).toBeDefined());
 
     await plan('Plan me a day.');
     await waitFor(() => expect(runPlanTrip).toHaveBeenCalled());
-    const call = runPlanTrip.mock.calls.at(-1) as [string, unknown, string | undefined];
-    expect(call[2]).toBeUndefined();
+    const call = runPlanTrip.mock.calls.at(-1) as [string, unknown, {openaiKey?: string}];
+    expect(call[2].openaiKey).toBeUndefined();
   });
 });
 
@@ -608,10 +849,8 @@ describe('conversation threads', () => {
     const user = await plan('Plan me an afternoon in Lagos.');
     await waitFor(() => expect(runPlanTrip).toHaveBeenCalledTimes(1));
 
-    const composerNew = document.querySelector('.actions .btn.ghost') as HTMLButtonElement;
-    expect(composerNew).not.toBeNull();
-    await user.click(composerNew);
-    await waitFor(() => expect(screen.getByText(/nothing planned yet/i)).toBeDefined());
+    await user.click(screen.getByRole('button', {name: /new plan/i}));
+    await waitFor(() => expect(screen.getByText(/what's the plan/i)).toBeDefined());
 
     await plan('Plan me a morning in Lisbon.');
     await waitFor(() => expect(runPlanTrip).toHaveBeenCalledTimes(2));
@@ -619,5 +858,475 @@ describe('conversation threads', () => {
     const first = (runPlanTrip.mock.calls[0] as [string, {threadId: string}])[1].threadId;
     const second = (runPlanTrip.mock.calls[1] as [string, {threadId: string}])[1].threadId;
     expect(second).not.toBe(first);
+  });
+});
+
+/**
+ * The product shell.
+ *
+ * These cover the surfaces the redesign introduced — sidebar, composer,
+ * collapsing execution panel, save action, account menu — with the same rule as
+ * everything else here: assert what a user can observe, and never assert that
+ * something sensitive is merely hidden when it should be absent.
+ */
+describe('application shell', () => {
+  const CONVERSATIONS = [
+    {
+      threadId: 'thread-lagos',
+      title: 'Lagos Afternoon',
+      createdAt: '2026-08-20T10:00:00.000Z',
+      updatedAt: new Date().toISOString()
+    },
+    {
+      threadId: 'thread-lisbon',
+      title: 'Lisbon Weekend',
+      createdAt: '2026-08-19T10:00:00.000Z',
+      updatedAt: new Date(Date.now() - 86_400_000).toISOString()
+    }
+  ];
+
+  it('lists conversations by title and relative day, never by thread id', async () => {
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Lagos Afternoon')).toBeDefined());
+
+    expect(screen.getByText('Today')).toBeDefined();
+    expect(screen.getByText('Yesterday')).toBeDefined();
+
+    const sidebar = document.querySelector('.sidebar')?.textContent ?? '';
+    expect(sidebar).not.toContain('thread-lagos');
+    expect(sidebar).not.toContain('thread-lisbon');
+  });
+
+  it('marks the active conversation for assistive technology, not just colour', async () => {
+    localStorage.setItem('planmyday.activeThreadId', 'thread-lagos');
+    fetchConversations.mockResolvedValue({conversations: CONVERSATIONS});
+    fetchConversation.mockResolvedValue({...CONVERSATIONS[0], turns: []});
+
+    render(<App />);
+    await waitFor(() => expect(fetchConversation).toHaveBeenCalled());
+
+    const active = document.querySelector('.conversation-item[aria-current="true"]');
+    expect(active?.textContent).toContain('Lagos Afternoon');
+  });
+
+  it('shows an empty sidebar state before anything is planned', async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/no plans yet/i)).toBeDefined());
+  });
+
+  it('reports a failed conversation list without leaking the error', async () => {
+    fetchConversations.mockRejectedValue(new Error('SQLITE_ERROR: no such table'));
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/could not be loaded/i)).toBeDefined());
+    expect(document.body.textContent).not.toContain('SQLITE_ERROR');
+  });
+});
+
+describe('composer', () => {
+  it('submits on Enter', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const box = screen.getByLabelText(/your request/i);
+    await user.type(box, 'Plan me an afternoon in Lagos.{Enter}');
+
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalledTimes(1));
+  });
+
+  it('inserts a newline on Shift+Enter instead of sending', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const box = screen.getByLabelText(/your request/i) as HTMLTextAreaElement;
+    await user.type(box, 'First line{Shift>}{Enter}{/Shift}second line');
+
+    expect(box.value).toContain('\n');
+    expect(runPlanTrip).not.toHaveBeenCalled();
+  });
+
+  it('disables input and sending while a run is in flight', async () => {
+    let release: (value: AgentResponse) => void = () => {};
+    runPlanTrip.mockReturnValue(new Promise<AgentResponse>(resolve => (release = resolve)));
+
+    render(<App />);
+    await plan('Plan something.');
+
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText(/your request/i) as HTMLTextAreaElement).disabled
+      ).toBe(true)
+    );
+    expect(screen.getByRole('button', {name: /send request/i}).hasAttribute('disabled')).toBe(true);
+
+    release(itineraryResponse);
+  });
+
+  it('does not start a second run while one is already running', async () => {
+    let release: (value: AgentResponse) => void = () => {};
+    runPlanTrip.mockReturnValue(new Promise<AgentResponse>(resolve => (release = resolve)));
+
+    render(<App />);
+    const user = await plan('Plan something.');
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalledTimes(1));
+
+    // Enter while busy must not queue another run.
+    await user.type(screen.getByLabelText(/your request/i), '{Enter}');
+    expect(runPlanTrip).toHaveBeenCalledTimes(1);
+
+    release(itineraryResponse);
+  });
+
+  it('keeps the request in the box when the run fails', async () => {
+    runPlanTrip.mockRejectedValue(new MastraRequestError(500, 'Nope.'));
+
+    render(<App />);
+    await plan('Plan me an afternoon in Lagos.');
+
+    await waitFor(() => expect(screen.getByRole('alert')).toBeDefined());
+    expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe(
+      'Plan me an afternoon in Lagos.'
+    );
+  });
+
+  it('offers follow-up hints only once there is something to follow up on', async () => {
+    render(<App />);
+    expect(screen.queryByRole('button', {name: /make it more relaxed/i})).toBeNull();
+
+    const user = await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(document.querySelector('.itinerary')).not.toBeNull());
+
+    // Each hint is a phrase the agent genuinely handles.
+    await user.click(screen.getByRole('button', {name: /make it more relaxed/i}));
+    expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe(
+      'Make it more relaxed'
+    );
+  });
+});
+
+describe('execution panel lifecycle', () => {
+  it('collapses to a summary once the run succeeds, and expands on click', async () => {
+    let emit: (event: unknown) => void = () => {};
+    let release: (value: AgentResponse) => void = () => {};
+
+    runPlanTrip.mockImplementation(
+      (_t: unknown, _i: unknown, options: {onEvent?: (event: unknown) => void}) => {
+        emit = options.onEvent ?? (() => {});
+        return new Promise<AgentResponse>(resolve => (release = resolve));
+      }
+    );
+
+    render(<App />);
+    const user = await plan('Plan something.');
+    await waitFor(() => expect(document.querySelector('.execution')).not.toBeNull());
+
+    act(() => {
+      emit({
+        type: 'tool_completed',
+        marker: 'plan-execution-event',
+        tool: 'get-weather',
+        durationMs: 2000,
+        timestamp: 'now'
+      });
+      emit({
+        type: 'run_completed',
+        marker: 'plan-execution-event',
+        durationMs: 33500,
+        timestamp: 'now'
+      });
+    });
+
+    release(itineraryResponse);
+
+    // Collapsed: the headline is there, the step detail is not.
+    await waitFor(() => expect(screen.getByText(/planned in 33\.5s/i)).toBeDefined());
+    expect(screen.getByText(/1 operation/i)).toBeDefined();
+    expect(document.querySelector('.execution-body')).toBeNull();
+
+    await user.click(screen.getByText(/planned in 33\.5s/i));
+    await waitFor(() => expect(document.querySelector('.execution-body')).not.toBeNull());
+  });
+
+  it('keeps the timeline open when a run fails', async () => {
+    runPlanTrip.mockRejectedValue(new MastraRequestError(500, 'Nope.'));
+
+    render(<App />);
+    await plan('Plan something.');
+
+    await waitFor(() => expect(screen.getByRole('alert')).toBeDefined());
+    expect(document.querySelector('.execution-failed')).not.toBeNull();
+    expect(document.querySelector('.execution-body')).not.toBeNull();
+  });
+
+  it('renders each validation pass and the correction between them', async () => {
+    let emit: (event: unknown) => void = () => {};
+    let release: (value: AgentResponse) => void = () => {};
+
+    runPlanTrip.mockImplementation(
+      (_t: unknown, _i: unknown, options: {onEvent?: (event: unknown) => void}) => {
+        emit = options.onEvent ?? (() => {});
+        return new Promise<AgentResponse>(resolve => (release = resolve));
+      }
+    );
+
+    render(<App />);
+    await plan('Plan something.');
+    await waitFor(() => expect(document.querySelector('.execution')).not.toBeNull());
+
+    act(() => {
+      emit({
+        type: 'validation_completed',
+        marker: 'plan-execution-event',
+        valid: false,
+        issueCount: 2,
+        issueCodes: ['start_too_early', 'overlap'],
+        timestamp: 'now'
+      });
+      emit({
+        type: 'correction_started',
+        marker: 'plan-execution-event',
+        attempt: 1,
+        timestamp: 'now'
+      });
+      emit({
+        type: 'validation_completed',
+        marker: 'plan-execution-event',
+        valid: true,
+        issueCount: 0,
+        issueCodes: [],
+        timestamp: 'now'
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText(/2 issues found/i)).toBeDefined());
+    // Issue codes are translated, never dumped raw.
+    expect(screen.getByText(/started earlier than you wanted/i)).toBeDefined();
+    expect(document.body.textContent).not.toContain('start_too_early');
+    expect(screen.getByText(/correcting the plan/i)).toBeDefined();
+    expect(screen.getByText(/corrected plan is valid/i)).toBeDefined();
+
+    release(itineraryResponse);
+  });
+});
+
+describe('saving a plan', () => {
+  it('sends an explicit save request rather than saving on its own', async () => {
+    render(<App />);
+    const user = await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(document.querySelector('.itinerary')).not.toBeNull());
+
+    // Planning alone must never have saved anything.
+    expect(runPlanTrip).toHaveBeenCalledTimes(1);
+
+    runPlanTrip.mockResolvedValue({
+      kind: 'message',
+      message: 'Itinerary saved.',
+      permissionDenied: false,
+      requiredPermission: null
+    } as AgentResponse);
+
+    await user.click(screen.getByRole('button', {name: /save itinerary/i}));
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalledTimes(2));
+
+    const [, input] = runPlanTrip.mock.calls.at(-1) as [unknown, {message: string}];
+    expect(input.message).toMatch(/save this itinerary/i);
+
+    await waitFor(() => expect(screen.getByText(/^Saved$/)).toBeDefined());
+  });
+
+  it('shows the server refusal and does not mark the plan saved', async () => {
+    render(<App />);
+    const user = await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(document.querySelector('.itinerary')).not.toBeNull());
+
+    runPlanTrip.mockResolvedValue({
+      kind: 'message',
+      message: 'You do not have permission to save itineraries.',
+      permissionDenied: true,
+      requiredPermission: 'create:itinerary'
+    } as AgentResponse);
+
+    await user.click(screen.getByRole('button', {name: /save itinerary/i}));
+    await waitFor(() => expect(screen.getByText(/not permitted/i)).toBeDefined());
+
+    // The refusal is the server's; the UI never decided it.
+    expect(screen.queryByText(/^Saved$/)).toBeNull();
+    expect(screen.getByText('create:itinerary')).toBeDefined();
+  });
+});
+
+describe('account menu', () => {
+  it('opens, closes on Escape, and returns focus to its trigger', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const trigger = await screen.findByRole('button', {name: /alice@example.com/i});
+    await user.click(trigger);
+    expect(screen.getByRole('dialog', {name: /account and settings/i})).toBeDefined();
+
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('explains where the key goes without echoing one', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', {name: /alice@example.com/i}));
+    expect(screen.getByText(/kept in memory only/i)).toBeDefined();
+    expect(document.body.textContent).not.toMatch(/sk-/);
+  });
+});
+
+describe('mobile navigation', () => {
+  it('opens the sidebar from the workspace and closes it on selection', async () => {
+    fetchConversations.mockResolvedValue({
+      conversations: [
+        {
+          threadId: 'thread-lagos',
+          title: 'Lagos Afternoon',
+          createdAt: '2026-08-20T10:00:00.000Z',
+          updatedAt: '2026-08-21T10:00:00.000Z'
+        }
+      ]
+    });
+    fetchConversation.mockResolvedValue({
+      threadId: 'thread-lagos',
+      title: 'Lagos Afternoon',
+      createdAt: '2026-08-20T10:00:00.000Z',
+      updatedAt: '2026-08-21T10:00:00.000Z',
+      turns: []
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    const toggle = screen.getByRole('button', {name: /show conversations/i});
+    await user.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.querySelector('.sidebar.open')).not.toBeNull();
+
+    await user.click(await screen.findByText('Lagos Afternoon'));
+    await waitFor(() => expect(document.querySelector('.sidebar.open')).toBeNull());
+  });
+});
+
+describe('recovering from a failed run', () => {
+  it('offers to try the same request again without retyping it', async () => {
+    runPlanTrip.mockRejectedValue(
+      new MastraRequestError(
+        500,
+        'The model replied in a form the planner could not read.',
+        'model_output_invalid' as never,
+        'model_output_invalid'
+      )
+    );
+
+    render(<App />);
+    const user = await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(screen.getByRole('alert')).toBeDefined());
+
+    // A transient formatting failure is named as such, not blamed on the user.
+    expect(screen.getByText(/couldn't produce a plan this time/i)).toBeDefined();
+    expect(document.body.textContent).not.toMatch(/try rephrasing/i);
+
+    runPlanTrip.mockResolvedValue(itineraryResponse);
+    await user.click(screen.getByRole('button', {name: /try again/i}));
+
+    await waitFor(() => expect(runPlanTrip).toHaveBeenCalledTimes(2));
+    const [, input] = runPlanTrip.mock.calls.at(-1) as [unknown, {message: string}];
+    expect(input.message).toBe('Plan me an afternoon in Lagos.');
+  });
+
+  it('keeps technical detail behind the existing toggle', async () => {
+    runPlanTrip.mockRejectedValue(
+      new MastraRequestError(500, 'Nope.', 'workflow_failed' as never, 'internal detail here')
+    );
+
+    render(<App />);
+    const user = await plan('Plan something.');
+    await waitFor(() => expect(screen.getByRole('alert')).toBeDefined());
+
+    expect(screen.queryByText(/internal detail here/i)).toBeNull();
+    await user.click(screen.getByRole('button', {name: /show details/i}));
+    expect(screen.getByText(/internal detail here/i)).toBeDefined();
+  });
+});
+
+describe('the empty workspace', () => {
+  it('offers example requests that fill the composer', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const example = await screen.findByRole('button', {
+      name: /plan a relaxed afternoon in lagos tomorrow/i
+    });
+    await user.click(example);
+
+    expect((screen.getByLabelText(/your request/i) as HTMLTextAreaElement).value).toBe(
+      'Plan a relaxed afternoon in Lagos tomorrow.'
+    );
+  });
+
+  it('disappears once there is a plan', async () => {
+    render(<App />);
+    expect(screen.getByText(/what's the plan/i)).toBeDefined();
+
+    await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(document.querySelector('.itinerary')).not.toBeNull());
+
+    expect(screen.queryByText(/what's the plan/i)).toBeNull();
+  });
+});
+
+describe('the execution panel reports retries honestly', () => {
+  it('counts a retry only when the server said one happened', async () => {
+    let emit: (event: unknown) => void = () => {};
+    let release: (value: AgentResponse) => void = () => {};
+
+    runPlanTrip.mockImplementation(
+      (_t: unknown, _i: unknown, options: {onEvent?: (event: unknown) => void}) => {
+        emit = options.onEvent ?? (() => {});
+        return new Promise<AgentResponse>(resolve => (release = resolve));
+      }
+    );
+
+    render(<App />);
+    const user = await plan('Plan something.');
+    await waitFor(() => expect(document.querySelector('.execution')).not.toBeNull());
+
+    act(() => {
+      // The workflow emits both: the stage the user sees, and the count.
+      emit({
+        type: 'stage_started',
+        marker: 'plan-execution-event',
+        stage: 'retry',
+        timestamp: 'now'
+      });
+      emit({type: 'model_retry', marker: 'plan-execution-event', attempt: 1, timestamp: 'now'});
+      emit({
+        type: 'run_completed',
+        marker: 'plan-execution-event',
+        durationMs: 12000,
+        timestamp: 'now'
+      });
+    });
+    release(itineraryResponse);
+
+    await waitFor(() => expect(screen.getByText(/1 retry/i)).toBeDefined());
+
+    await user.click(screen.getByText(/planned in/i));
+    await waitFor(() => expect(screen.getByText(/retrying/i)).toBeDefined());
+  });
+
+  it('says nothing about retries for a clean run', async () => {
+    render(<App />);
+    await plan('Plan me an afternoon in Lagos.');
+    await waitFor(() => expect(document.querySelector('.itinerary')).not.toBeNull());
+
+    expect(document.body.textContent).not.toMatch(/retry|retrying/i);
   });
 });

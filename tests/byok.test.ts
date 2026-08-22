@@ -220,3 +220,95 @@ describe('the key stays out of durable and observable surfaces', () => {
     expect(OPENAI_KEY_HEADER).not.toContain('?');
   });
 });
+
+/**
+ * The surfaces added since BYOK was built.
+ *
+ * A caller's key is only as contained as the newest thing that touches a
+ * request. Execution telemetry and conversation replay both stream data to the
+ * browser, so both are checked here rather than assumed safe.
+ */
+describe('the key stays out of the surfaces added later', () => {
+  it('has no field in the telemetry contract that could carry it', async () => {
+    const {PlanExecutionEventSchema} = await import('../src/mastra/telemetry/plan-events.js');
+
+    const fields = PlanExecutionEventSchema.options.flatMap(option => Object.keys(option.shape));
+    for (const field of fields) {
+      expect(field).not.toMatch(/key|token|secret|authorization|apikey/i);
+    }
+  });
+
+  it('is dropped by the telemetry emitter even if a caller passes one', async () => {
+    const {PlanTelemetry, PLAN_EVENT_MARKER} = await import(
+      '../src/mastra/telemetry/plan-events.js'
+    );
+
+    const written: unknown[] = [];
+    const telemetry = new PlanTelemetry({write: value => written.push(value)}, 'run-1');
+
+    await (telemetry as unknown as {emit: (e: unknown) => Promise<void>}).emit?.({
+      type: 'run_started',
+      marker: PLAN_EVENT_MARKER,
+      runId: 'run-1',
+      timestamp: new Date().toISOString(),
+      apiKey: 'sk-must-not-be-emitted'
+    });
+    await telemetry.runStarted();
+
+    expect(JSON.stringify(written)).not.toContain('sk-must-not-be-emitted');
+  });
+
+  it('has no field in conversation metadata that could carry it', async () => {
+    const {deriveConversationTitle} = await import('../src/mastra/lib/conversations.js');
+
+    // The title is the only user-derived text stored about a conversation.
+    const title = deriveConversationTitle('Plan my day sk-should-not-persist');
+    expect(title).not.toContain('sk-should-not-persist');
+  });
+
+  it('is not reconstructed into a replayed turn', async () => {
+    const {buildTurns} = await import('../src/mastra/lib/conversations.js');
+
+    const turns = buildTurns([
+      {
+        role: 'user',
+        content: {format: 2, parts: [{type: 'text', text: 'Plan my day.'}]},
+        createdAt: '1'
+      },
+      {
+        role: 'assistant',
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'result',
+                toolName: 'get-weather',
+                args: {apiKey: 'sk-in-tool-args'},
+                result: {apiKey: 'sk-in-tool-result'}
+              }
+            },
+            {type: 'text', text: 'Here is your day.'}
+          ]
+        },
+        createdAt: '2'
+      }
+    ]);
+
+    const serialised = JSON.stringify(turns);
+    expect(serialised).not.toContain('sk-in-tool-args');
+    expect(serialised).not.toContain('sk-in-tool-result');
+  });
+
+  it('is removed from any error detail shown to the user', async () => {
+    const {sanitizeDetail} = await import('../src/app/lib/failure.js');
+
+    const detail = sanitizeDetail(
+      'AI_APICallError: request failed with key sk-live-abcdef1234567890 and Bearer eyJhbGciOiJIUzI1NiJ9.abc.def'
+    );
+
+    expect(detail).not.toContain('sk-live-abcdef1234567890');
+    expect(detail).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+  });
+});

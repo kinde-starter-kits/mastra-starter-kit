@@ -201,3 +201,46 @@ describe('nothing sensitive can reach the stream', () => {
     expect(JSON.stringify(event)).not.toContain('outside the requested');
   });
 });
+
+/**
+ * Retrying is reported only when it happened.
+ *
+ * The timeline is the user's evidence that the run behaved. A "Retrying" line
+ * for a run that never retried would be exactly the fabricated progress the
+ * telemetry design exists to prevent.
+ */
+describe('model retry telemetry', () => {
+  it('emits an attempt number when the model is asked again', async () => {
+    const written: unknown[] = [];
+    const telemetry = new PlanTelemetry({write: value => written.push(value)}, 'run-retry');
+
+    await telemetry.modelRetry(1);
+    await telemetry.modelRetry(2);
+
+    expect(written).toEqual([
+      expect.objectContaining({type: 'model_retry', attempt: 1}),
+      expect.objectContaining({type: 'model_retry', attempt: 2})
+    ]);
+  });
+
+  it('is part of the published contract, so the browser can render it', async () => {
+    const {PlanExecutionEventSchema} = await import('../src/mastra/telemetry/plan-events.js');
+    const kinds = PlanExecutionEventSchema.options.map(option => option.shape.type.value);
+
+    expect(kinds).toContain('model_retry');
+  });
+
+  it('carries nothing beyond the attempt and a timestamp', async () => {
+    const written: unknown[] = [];
+    const telemetry = new PlanTelemetry({write: value => written.push(value)}, 'run-retry');
+
+    await telemetry.modelRetry(1);
+
+    expect(Object.keys(written[0] as object).sort()).toEqual([
+      'attempt',
+      'marker',
+      'timestamp',
+      'type'
+    ]);
+  });
+});

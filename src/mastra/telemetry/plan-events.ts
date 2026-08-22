@@ -19,7 +19,9 @@ export const PLAN_STAGES = [
   'activities',
   'planning',
   'validation',
-  'correction'
+  'correction',
+  /** Re-asking the model after it answered in prose instead of the schema. */
+  'retry'
 ] as const;
 export type PlanStage = (typeof PLAN_STAGES)[number];
 
@@ -99,6 +101,18 @@ export const PlanExecutionEventSchema = z.discriminatedUnion('type', [
   }),
   z.object({
     type: z.literal('correction_started'),
+    marker: z.literal(PLAN_EVENT_MARKER),
+    attempt: z.int().min(1),
+    timestamp: z.string()
+  }),
+  z.object({
+    /**
+     * The model returned no usable object and is being asked again.
+     *
+     * Emitted only when a retry actually happens, so the timeline can say
+     * "Retrying" without ever inventing it.
+     */
+    type: z.literal('model_retry'),
     marker: z.literal(PLAN_EVENT_MARKER),
     attempt: z.int().min(1),
     timestamp: z.string()
@@ -226,6 +240,15 @@ export class PlanTelemetry {
       valid,
       issueCount: issueCodes.length,
       issueCodes: issueCodes.slice(0, 20),
+      timestamp: this.now()
+    });
+  }
+
+  modelRetry(attempt: number) {
+    return this.emit({
+      type: 'model_retry',
+      marker: PLAN_EVENT_MARKER,
+      attempt,
       timestamp: this.now()
     });
   }

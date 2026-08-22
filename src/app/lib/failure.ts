@@ -19,6 +19,9 @@ export type FailureKind =
   | 'model_unreachable'
   | 'mastra_unreachable'
   | 'workflow_failed'
+  | 'itinerary_invalid'
+  | 'unchanged_itinerary'
+  | 'model_output_invalid'
   | 'unknown';
 
 export const FAILURE_TITLES: Record<FailureKind, string> = {
@@ -31,6 +34,9 @@ export const FAILURE_TITLES: Record<FailureKind, string> = {
   model_unreachable: 'Could not reach OpenAI',
   mastra_unreachable: 'Could not reach the Mastra server',
   workflow_failed: 'Unable to build your plan',
+  itinerary_invalid: 'That plan did not fit your request',
+  unchanged_itinerary: 'That change could not be made',
+  model_output_invalid: "Couldn't produce a plan this time",
   unknown: 'Unable to build your plan'
 };
 
@@ -45,6 +51,12 @@ const MESSAGES: Record<FailureKind, string> = {
     'The request could not connect to the OpenAI API. This is usually temporary — try again.',
   mastra_unreachable: 'The planning server is not responding.',
   workflow_failed: 'The planning agent could not complete this request.',
+  itinerary_invalid:
+    'The planner could not build a day that satisfied every constraint you asked for, even after trying again. Try relaxing one of them.',
+  unchanged_itinerary:
+    'The planner could not change the plan in the way you asked with the activities available. Try naming what to change — a stop to drop, or a time to move.',
+  model_output_invalid:
+    'The model replied in a form the planner could not read, and did not recover after retrying. This is usually temporary — the same request often works on a second attempt.',
   unknown: 'Something went wrong with that request. Please try again.'
 };
 
@@ -78,6 +90,17 @@ export function classifyFailure(status: number, detail: string): FailureKind {
   if (/AI_APICallError|APICallError|openai\.com|server_error|\b5\d\d\b/i.test(text)) {
     return 'model_api_error';
   }
+
+  // The plan was generated but broke the user's own constraints, twice.
+  // The model answered in prose rather than the required object, repeatedly.
+  // A transport or credential problem is classified above this, so reaching
+  // here means the request was fine and the output was not.
+  if (/model_output_invalid|did not return a usable plan/i.test(text)) return 'model_output_invalid';
+
+  // A modification that came back identical, twice.
+  if (/unchanged_itinerary|could not change the plan/i.test(text)) return 'unchanged_itinerary';
+
+  if (/itinerary_invalid|did not satisfy the request/i.test(text)) return 'itinerary_invalid';
 
   if (status >= 500) return 'workflow_failed';
   return 'unknown';

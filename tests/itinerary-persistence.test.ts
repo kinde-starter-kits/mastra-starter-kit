@@ -20,7 +20,24 @@ process.env.KINDE_DOMAIN = TEST_DOMAIN;
 process.env.KINDE_AUDIENCE = TEST_AUDIENCE;
 process.env.KINDE_ALLOWED_ORG_CODES = '';
 
-const {saveItinerary, saveItineraryTool} = await import('../src/mastra/tools/save-itinerary.js');
+const {saveItinerary: saveItineraryRaw, saveItineraryTool: saveItineraryToolRaw} =
+  await import('../src/mastra/tools/save-itinerary.js');
+const {runWithSaveIntent} = await import('../src/mastra/lib/save-intent.js');
+
+/*
+ * These tests exercise authorization and ownership. Saving now also requires
+ * explicit user intent (see src/mastra/lib/save-intent.ts), which is a separate
+ * concern covered by tests/save-intent.test.ts — so intent is established here
+ * and each test keeps asserting only what it is about.
+ */
+const asked = <T>(fn: () => T): T => runWithSaveIntent('Save this itinerary.', fn);
+const saveItinerary: typeof saveItineraryRaw = (...args) => asked(() => saveItineraryRaw(...args));
+type ToolExecute = NonNullable<typeof saveItineraryToolRaw.execute>;
+const saveItineraryTool = {
+  ...saveItineraryToolRaw,
+  execute: ((...args: Parameters<ToolExecute>) =>
+    asked(() => (saveItineraryToolRaw.execute as ToolExecute)(...args))) as ToolExecute
+};
 const {listItineraries} = await import('../src/mastra/tools/list-itineraries.js');
 const {SavedItinerarySchema} = await import('../src/mastra/lib/itinerary-store.js');
 const {PERMISSIONS} = await import('../src/mastra/lib/kinde.js');

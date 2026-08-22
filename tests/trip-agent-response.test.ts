@@ -33,7 +33,16 @@ const {AgentResponseSchema, ItineraryResponseSchema, SavedListResponseSchema, Me
   await import('../src/mastra/schemas/agent-response.js');
 const {ItinerarySchema} = await import('../src/mastra/schemas/itinerary.js');
 const {PERMISSIONS} = await import('../src/mastra/lib/kinde.js');
-const {saveItinerary} = await import('../src/mastra/tools/save-itinerary.js');
+const {saveItinerary: saveItineraryRaw} = await import('../src/mastra/tools/save-itinerary.js');
+const {runWithSaveIntent} = await import('../src/mastra/lib/save-intent.js');
+
+/*
+ * Saving now also requires explicit user intent (src/mastra/lib/save-intent.ts).
+ * That gate has its own suite in tests/save-intent.test.ts; these tests are
+ * about what happens once the user has asked, so intent is established here.
+ */
+const saveItinerary: typeof saveItineraryRaw = (...args) =>
+  runWithSaveIntent('Save this itinerary.', () => saveItineraryRaw(...args));
 
 const READ = PERMISSIONS.readItinerary;
 const CREATE = PERMISSIONS.createItinerary;
@@ -99,10 +108,14 @@ async function run(
   // authenticated token — so every run here is authenticated, as in production.
   const context = requestContext ?? (await contextFor({sub: 'kp:default', permissions: [READ]}));
 
-  const result = await agent.generate(prompt, {
-    requestContext: context,
-    memory: {thread: `thread-${threadCounter}`}
-  } as never);
+  // The workflow runs every agent turn inside a save-intent scope derived from
+  // the user's own message; doing the same here keeps the tool path identical.
+  const result = await runWithSaveIntent(prompt, () =>
+    agent.generate(prompt, {
+      requestContext: context,
+      memory: {thread: `thread-${threadCounter}`}
+    } as never)
+  );
 
   return {model, result};
 }

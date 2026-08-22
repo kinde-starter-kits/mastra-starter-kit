@@ -119,3 +119,41 @@ describe('sanitisation of diagnostics', () => {
     expect(sanitizeDetail('')).toBeUndefined();
   });
 });
+
+/**
+ * Failures added by the stabilization pass.
+ *
+ * The distinction that matters: a plan that broke the user's own constraints is
+ * not a broken planner, and a follow-up the model could not structure is not an
+ * unreachable server. Reporting either as "could not reach the planner" sends
+ * the user to debug the wrong thing.
+ */
+describe('validation and follow-up failures', () => {
+  it('names a plan that could not satisfy the constraints', () => {
+    const kind = classifyFailure(500, 'ItineraryValidationError: The generated plan did not satisfy the request.');
+
+    expect(kind).toBe('itinerary_invalid');
+    expect(FAILURE_TITLES[kind]).toMatch(/did not fit your request/i);
+    expect(failureMessage(kind)).toMatch(/relaxing one of them/i);
+  });
+
+  it('does not blame the network when the model answered in prose', () => {
+    const kind = classifyFailure(
+      500,
+      'The planner could not turn that into a plan. Try saying what to change more specifically.'
+    );
+
+    expect(kind).toBe('workflow_failed');
+    expect(kind).not.toBe('mastra_unreachable');
+    expect(failureMessage(kind)).not.toMatch(/could not reach|not responding/i);
+  });
+
+  it('still reports a genuine transport drop as unreachable', () => {
+    // The workflow now passes the real cause through, so this keeps working.
+    expect(classifyFailure(500, 'UND_ERR_SOCKET: other side closed')).toBe('model_unreachable');
+  });
+
+  it('still reports an unreachable Mastra process distinctly', () => {
+    expect(classifyFailure(0, 'failed to fetch')).toBe('mastra_unreachable');
+  });
+});

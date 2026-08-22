@@ -2,7 +2,16 @@ import type {AgentResponse} from '../../mastra/schemas/agent-response';
 import type {Itinerary} from '../../mastra/schemas/itinerary';
 import type {SavedItinerary} from '../../mastra/schemas/saved-itinerary';
 
+import type {PlanExecutionEvent} from '../../mastra/telemetry/plan-events';
+
 import {env} from '../env';
+import {
+  createStreamDecoder,
+  outcomeFrom,
+  planEventFrom,
+  stepErrorFrom,
+  type StreamOutcome
+} from './stream-protocol';
 import {classifyFailure, failureMessage, sanitizeDetail, type FailureKind} from './failure';
 
 export type {FailureKind};
@@ -62,6 +71,32 @@ function friendlyError(status: number, detail: string): MastraRequestError {
   return new MastraRequestError(status, failureMessage(kind), kind, sanitizeDetail(detail));
 }
 
+/**
+ * The headers every Mastra call carries.
+ *
+ * Credentials live only here: the bearer token and the model key are headers,
+ * never query parameters and never request bodies, so neither can reach a URL,
+ * a server access log, or workflow state.
+ */
+function authHeaders(token: string | undefined, openaiKey?: string): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? {Authorization: `Bearer ${token}`} : {}),
+    // Sent per request, from memory. Never stored, never in the URL.
+    ...(openaiKey ? {[OPENAI_KEY_HEADER]: openaiKey} : {})
+  };
+}
+
+/** The single message shown when the Mastra process is not reachable. */
+function unreachable(cause: unknown): MastraRequestError {
+  console.error('[mastra] network failure', cause);
+  return new MastraRequestError(
+    0,
+    `Could not reach the Mastra server at ${env.mastraUrl}. Start it with "npm run dev:mastra", or run both processes with "npm run dev".`,
+    'mastra_unreachable'
+  );
+}
+
 async function callMastra<T>(
   path: string,
   token: string | undefined,
@@ -74,20 +109,12 @@ async function callMastra<T>(
     res = await fetch(`${env.mastraUrl}${path}`, {
       ...init,
       headers: {
-        'Content-Type': 'application/json',
-        ...(token ? {Authorization: `Bearer ${token}`} : {}),
-        // Sent per request, from memory. Never stored, never in the URL.
-        ...(openaiKey ? {[OPENAI_KEY_HEADER]: openaiKey} : {}),
+        ...authHeaders(token, openaiKey),
         ...init.headers
       }
     });
   } catch (cause) {
-    console.error('[mastra] network failure', cause);
-    throw new MastraRequestError(
-      0,
-      `Could not reach the Mastra server at ${env.mastraUrl}. Start it with "npm run dev:mastra", or run both processes with "npm run dev".`,
-      'mastra_unreachable'
-    );
+    throw unreachable(cause);
   }
 
   if (!res.ok) {
@@ -106,8 +133,19 @@ export type ConversationSummary = {
   updatedAt: string;
 };
 
+/**
+ * A replayed exchange. `response` is the same envelope a live run returns, so
+ * history renders through the same cards. The server rebuilds these from
+ * memory; raw tool arguments and results never cross this boundary.
+ */
+export type ConversationTurn = {
+  id: string;
+  request: string;
+  response: AgentResponse;
+};
+
 export type ConversationDetail = ConversationSummary & {
-  messages: {role: string; content: unknown; createdAt: string}[];
+  turns: ConversationTurn[];
 };
 
 /**
@@ -176,10 +214,16 @@ export async function runPlanTrip(
     throw new MastraRequestError(500, failureMessage(kind), kind, sanitizeDetail(detail));
   }
 
-  const response = run.result as AgentResponse | undefined;
+  return asAgentResponse(run.result, run);
+}
 
-  if (!response || typeof response !== 'object' || !('kind' in response)) {
-    console.error('[mastra] unexpected workflow result', run);
+/** The workflow key registered on the Mastra instance. */
+const PLAN_WORKFLOW = 'planTripWorkflow';
+
+/** Narrows a workflow result to the response envelope, or fails loudly. */
+function asAgentResponse(result: unknown, context: unknown): AgentResponse {
+  if (!result || typeof result !== 'object' || !('kind' in result)) {
+    console.error('[mastra] unexpected workflow result', context);
     throw new MastraRequestError(
       500,
       'The planner returned something unexpected. Please retry.',
@@ -187,5 +231,127 @@ export async function runPlanTrip(
     );
   }
 
-  return response;
+  return result as AgentResponse;
+}
+
+/**
+ * Raised when the caller aborts a run. Distinct from a failure so the UI can
+ * clear quietly instead of showing an error the user caused on purpose.
+ */
+export class PlanCancelledError extends Error {
+  constructor() {
+    super('Planning was cancelled.');
+    this.name = 'PlanCancelledError';
+  }
+}
+
+export type PlanStreamOptions = {
+  openaiKey?: string;
+  /** Called for each telemetry event, in wire order, as it arrives. */
+  onEvent?: (event: PlanExecutionEvent) => void;
+  signal?: AbortSignal;
+};
+
+function isAbort(cause: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true || (cause instanceof Error && cause.name === 'AbortError');
+}
+
+/**
+ * Run the plan-trip workflow, reporting progress as it happens.
+ *
+ * Mastra's streaming endpoint requires a `runId` query parameter and creates
+ * the run itself, so one request is enough — there is a `create-run` endpoint,
+ * but calling it first would only add a round trip. The wire format is
+ * documented and tested in `stream-protocol.ts`.
+ *
+ * The final itinerary still comes from the stream's terminal record, so the
+ * caller gets exactly the same `AgentResponse` as `runPlanTrip` — streaming
+ * adds visibility, not a second result contract. Only `message` and `threadId`
+ * are sent; identity and the model key stay in headers.
+ */
+export async function streamPlanTrip(
+  token: string | undefined,
+  input: {message: string; threadId: string},
+  options: PlanStreamOptions = {}
+): Promise<AgentResponse> {
+  const {openaiKey, onEvent, signal} = options;
+
+  const runId = crypto.randomUUID();
+
+  const url =
+    `${env.mastraUrl}/api/workflows/${PLAN_WORKFLOW}/stream` +
+    `?runId=${encodeURIComponent(runId)}`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: authHeaders(token, openaiKey),
+      // The model key is NOT in this body — it travels in a header, so it never
+      // enters workflow input, workflow state, or a trace.
+      body: JSON.stringify({inputData: input}),
+      signal
+    });
+  } catch (cause) {
+    if (isAbort(cause, signal)) throw new PlanCancelledError();
+    throw unreachable(cause);
+  }
+
+  if (!res.ok) {
+    throw friendlyError(res.status, await res.text().catch(() => ''));
+  }
+
+  if (!res.body) {
+    // No readable stream in this environment. The workflow still runs to
+    // completion on start-async, so degrade to it rather than failing.
+    console.warn('[mastra] streaming unsupported here; falling back to start-async');
+    return runPlanTrip(token, input, openaiKey);
+  }
+
+  const reader = res.body.getReader();
+  const text = new TextDecoder();
+  const decoder = createStreamDecoder();
+
+  let outcome: StreamOutcome | undefined;
+  let stepError: string | undefined;
+
+  const consume = (records: ReturnType<typeof decoder.push>) => {
+    for (const record of records) {
+      const event = planEventFrom(record);
+      if (event) {
+        onEvent?.(event);
+        continue;
+      }
+
+      stepError = stepErrorFrom(record) ?? stepError;
+      outcome = outcomeFrom(record) ?? outcome;
+    }
+  };
+
+  try {
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      consume(decoder.push(text.decode(value, {stream: true})));
+    }
+    consume(decoder.push(text.decode()));
+    consume(decoder.flush());
+  } catch (cause) {
+    if (isAbort(cause, signal)) throw new PlanCancelledError();
+    console.error('[mastra] stream interrupted', cause);
+    throw new MastraRequestError(
+      0,
+      'The connection dropped while planning. Please retry.',
+      'mastra_unreachable'
+    );
+  }
+
+  if (!outcome || outcome.status !== 'success') {
+    const detail = stepError ?? 'The workflow did not finish.';
+    const kind = classifyFailure(500, detail);
+    console.error('[mastra] workflow did not succeed', {status: outcome?.status, kind});
+    throw new MastraRequestError(500, failureMessage(kind), kind, sanitizeDetail(detail));
+  }
+
+  return asAgentResponse(outcome.finalResult, {runId});
 }

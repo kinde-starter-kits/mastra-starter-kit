@@ -22,7 +22,16 @@ process.env.KINDE_ALLOWED_ORG_CODES = '';
 
 const {createTripAgent} = await import('../src/mastra/agents/trip-agent.js');
 const {PERMISSIONS} = await import('../src/mastra/lib/kinde.js');
-const {saveItinerary} = await import('../src/mastra/tools/save-itinerary.js');
+const {saveItinerary: saveItineraryRaw} = await import('../src/mastra/tools/save-itinerary.js');
+const {runWithSaveIntent} = await import('../src/mastra/lib/save-intent.js');
+
+/*
+ * Saving now also requires explicit user intent (src/mastra/lib/save-intent.ts).
+ * That gate has its own suite in tests/save-intent.test.ts; these tests are
+ * about what happens once the user has asked, so intent is established here.
+ */
+const saveItinerary: typeof saveItineraryRaw = (...args) =>
+  runWithSaveIntent('Save this itinerary.', () => saveItineraryRaw(...args));
 
 const READ = PERMISSIONS.readItinerary;
 const CREATE = PERMISSIONS.createItinerary;
@@ -93,10 +102,14 @@ async function runWithTool(
   // Mastra derives it from the authenticated request context via
   // mapUserToResourceId, which is exactly the property we want exercised.
   threadCounter += 1;
-  const result = await agent.generate(prompt, {
-    requestContext,
-    memory: {thread: `thread-${threadCounter}`}
-  } as never);
+  // The workflow runs every agent turn inside a save-intent scope derived from
+  // the user's own message; doing the same here keeps the tool path identical.
+  const result = await runWithSaveIntent(prompt, () =>
+    agent.generate(prompt, {
+      requestContext,
+      memory: {thread: `thread-${threadCounter}`}
+    } as never)
+  );
 
   return {model, result};
 }

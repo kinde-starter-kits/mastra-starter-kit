@@ -1,4 +1,6 @@
 import {createTool} from '@mastra/core/tools';
+
+import {saveIntentGranted} from '../lib/save-intent';
 import {z} from 'zod';
 import type {RequestContext} from '@mastra/core/request-context';
 
@@ -27,7 +29,13 @@ import {insertItinerary, type ItineraryOwner} from '../lib/itinerary-store';
  */
 
 /** Why a save did or did not happen. */
-export const SAVE_OUTCOMES = ['saved', 'unauthenticated', 'permission_denied'] as const;
+export const SAVE_OUTCOMES = [
+  'saved',
+  'unauthenticated',
+  'permission_denied',
+  /** The user never asked for this. See `lib/save-intent`. */
+  'not_requested'
+] as const;
 export type SaveOutcome = (typeof SAVE_OUTCOMES)[number];
 
 export const SaveItineraryInputSchema = z.object({
@@ -90,12 +98,27 @@ export async function saveItinerary(
   const requestContext = context?.requestContext;
   const user = getKindeUser(requestContext);
 
-  // 1. There must be a verified human identity behind this call.
+  /*
+   * 1. The user must have asked for this.
+   *
+   * Generating a good plan is not a reason to persist it. The agent was
+   * instructed never to save unprompted and did so anyway, so the rule is
+   * enforced here instead of trusted to the prompt. The intent is derived
+   * server-side from the user's own message, never supplied by the caller.
+   */
+  if (!saveIntentGranted()) {
+    return denied(
+      'not_requested',
+      'I have not saved this. Ask me to save it if you would like to keep it.'
+    );
+  }
+
+  // 2. There must be a verified human identity behind this call.
   if (!user) {
     return denied('unauthenticated', 'You must be signed in to save an itinerary.');
   }
 
-  // 2. Fail closed: an absent permissions claim grants nothing.
+  // 3. Fail closed: an absent permissions claim grants nothing.
   if (!hasPermission(user, PERMISSIONS.createItinerary)) {
     return denied(
       'permission_denied',
@@ -104,7 +127,7 @@ export async function saveItinerary(
     );
   }
 
-  // 3. Ownership is derived, never accepted.
+  // 4. Ownership is derived, never accepted.
   const owner = resolveOwner(requestContext);
   if (!owner) {
     return denied(

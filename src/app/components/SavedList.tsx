@@ -3,70 +3,66 @@ import {useState} from 'react';
 import type {SavedItinerary} from '../lib/mastra-client';
 import {ItineraryCard} from './ItineraryCard';
 
-function formatSavedAt(iso: string): string {
-  const parsed = new Date(iso);
-  if (Number.isNaN(parsed.getTime())) return iso;
-  return parsed.toLocaleString(undefined, {
-    day: 'numeric',
-    month: 'short',
-    hour: '2-digit',
-    minute: '2-digit'
-  });
+/**
+ * Plans the user saved earlier, exactly as `list-itineraries` returned them.
+ *
+ * Collapsed by default: a list of saved plans is for finding one, not reading
+ * them all at once. Opening a row renders the same `ItineraryCard` a live plan
+ * uses, so a saved plan and a fresh one are the same object to the reader.
+ *
+ * Deliberately thin on identity — what was saved and when, never who owns it.
+ * Ownership was decided on the server, and repeating an org code or resource id
+ * here would leak scoping internals into the interface for no benefit.
+ */
+
+function formatSavedAt(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toLocaleDateString(undefined, {day: 'numeric', month: 'short', year: 'numeric'});
+}
+
+function SavedRow({saved}: {saved: SavedItinerary}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <li>
+      <button
+        type="button"
+        className="saved-row saved-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen(value => !value)}
+      >
+        <span className="saved-where">
+          {saved.itinerary.destination}
+          <span className="muted"> · {saved.itinerary.date}</span>
+        </span>
+        <span className="saved-when">{formatSavedAt(saved.createdAt)}</span>
+      </button>
+
+      {open ? <ItineraryCard itinerary={saved.itinerary} /> : null}
+    </li>
+  );
 }
 
 export function SavedList({itineraries}: {itineraries: SavedItinerary[]}) {
-  const [openId, setOpenId] = useState<string | null>(null);
-
   if (itineraries.length === 0) {
     return (
-      <article className="card empty">
-        <h2>No saved itineraries yet</h2>
-        <p className="muted">
-          Plan a day, then ask to save it. Saving needs the <code>create:itinerary</code>{' '}
-          permission in Kinde.
-        </p>
-      </article>
+      <div className="card message">
+        <p className="muted">No saved itineraries yet.</p>
+      </div>
     );
   }
 
   return (
-    <article className="card" aria-label="Saved itineraries">
-      <header className="saved-head">
-        <p className="eyebrow">Saved</p>
-        <h2>
-          {itineraries.length} saved {itineraries.length === 1 ? 'itinerary' : 'itineraries'}
-        </h2>
-      </header>
-
-      <ul className="saved-list">
-        {itineraries.map(saved => {
-          const isOpen = openId === saved.id;
-          return (
-            <li key={saved.id} className={isOpen ? 'saved-item open' : 'saved-item'}>
-              <button
-                type="button"
-                className="saved-toggle"
-                aria-expanded={isOpen}
-                onClick={() => setOpenId(isOpen ? null : saved.id)}
-              >
-                <span className="saved-main">
-                  <strong>{saved.itinerary.destination}</strong>
-                  <span className="muted">{saved.itinerary.date}</span>
-                </span>
-                <span className="saved-summary">{saved.itinerary.summary}</span>
-                <span className="saved-meta">
-                  Saved {formatSavedAt(saved.createdAt)}
-                  <span className="chev" aria-hidden="true">
-                    {isOpen ? '▲' : '▼'}
-                  </span>
-                </span>
-              </button>
-
-              {isOpen ? <ItineraryCard itinerary={saved.itinerary} /> : null}
-            </li>
-          );
-        })}
+    <div className="saved-list-wrap">
+      <p className="section-label">
+        {itineraries.length} saved {itineraries.length === 1 ? 'itinerary' : 'itineraries'}
+      </p>
+      <ul className="saved-list" aria-label="Saved itineraries">
+        {itineraries.map(saved => (
+          <SavedRow key={saved.id} saved={saved} />
+        ))}
       </ul>
-    </article>
+    </div>
   );
 }

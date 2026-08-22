@@ -314,10 +314,21 @@ export function validateItinerary(input: ValidateInput): ValidationResult {
  * attempt. Deliberately states the rule that was broken rather than dictating
  * a specific replacement, so the model still does the planning.
  */
+/**
+ * The opening line of a correction prompt.
+ *
+ * Correction prompts are written by the workflow, not by the traveller, but
+ * they are sent through the agent and therefore stored in the thread like any
+ * other user message. Replay uses this to recognise them, so a transcript shows
+ * what the user actually said rather than machinery talking to itself.
+ */
+export const CORRECTION_PROMPT_PREFIX =
+  'The plan you produced does not satisfy the request.';
+
 export function buildCorrectionPrompt(issues: ValidationIssue[]): string {
   const lines = issues.map(issue => `- ${issue.message}`).join('\n');
   return [
-    'The plan you produced does not satisfy the request. Fix these problems and return a corrected itinerary:',
+    `${CORRECTION_PROMPT_PREFIX} Fix these problems and return a corrected itinerary:`,
     lines,
     'Keep everything that was already correct. Use only activities returned by find-activities, and respect their opening hours.'
   ].join('\n\n');

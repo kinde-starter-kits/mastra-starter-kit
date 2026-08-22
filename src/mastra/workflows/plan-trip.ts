@@ -1,9 +1,18 @@
 import {createStep, createWorkflow} from '@mastra/core/workflows';
+
+import {runWithSaveIntent} from '../lib/save-intent';
 import type {Mastra} from '@mastra/core/mastra';
 import {z} from 'zod';
 
 import {AgentResponseSchema, type AgentResponse} from '../schemas/agent-response';
-import {ensureConversation} from '../lib/conversations';
+import {ensureConversation, latestItinerary, recordTurnResponse} from '../lib/conversations';
+import {
+  buildFollowUpPrompt,
+  buildUnchangedPrompt,
+  buildUnsatisfiedPrompt,
+  classifyRequest
+} from '../lib/follow-up';
+import {materiallyIdentical, satisfiesRequest} from '../lib/itinerary-diff';
 import {PLAN_TOOLS, PlanTelemetry, type PlanTool} from '../telemetry/plan-events';
 import {tripMemory} from '../memory';
 import {getKindeUser, resourceIdForUser} from '../lib/kinde';
@@ -75,6 +84,32 @@ export class ItineraryValidationError extends Error {
 /** How many correction attempts are made. One, deliberately — never a loop. */
 export const MAX_CORRECTION_ATTEMPTS = 1;
 
+/**
+ * How many times the model is asked again when it returns no usable object.
+ *
+ * Measured against the live model: roughly one follow-up turn in four came back
+ * with `finishReason: 'other'` and no object, having answered in prose instead
+ * of the schema. New plans never did — the failure is specific to turns that
+ * modify an existing plan. It is a formatting slip rather than a disagreement,
+ * so asking again works; three attempts takes a ~25% failure to under 2%.
+ *
+ * Bounded on purpose. A repeated failure is reported as
+ * `model_output_invalid` rather than retried away, so a deterministic bug can
+ * never hide behind the retry.
+ */
+export const MAX_OUTPUT_ATTEMPTS = 3;
+
+/** Raised when the model never produced a usable object. */
+export class ModelOutputError extends Error {
+  readonly code = 'model_output_invalid';
+  constructor(readonly attempts: number) {
+    super(
+      `The model did not return a usable plan after ${attempts} attempts (model_output_invalid).`
+    );
+    this.name = 'ModelOutputError';
+  }
+}
+
 
 /** Tool names we report on. Anything else the agent calls is not surfaced. */
 function asPlanTool(name: unknown): PlanTool | undefined {
@@ -97,7 +132,31 @@ async function runAgentWithTelemetry(input: {
   threadId: string;
   telemetry: PlanTelemetry;
 }): Promise<AgentResponse | undefined> {
+  const {telemetry} = input;
+
+  for (let attempt = 1; attempt <= MAX_OUTPUT_ATTEMPTS; attempt += 1) {
+    const response = await runAgentOnce(input);
+    if (response) return response;
+
+    // Only announced when another attempt genuinely follows.
+    if (attempt < MAX_OUTPUT_ATTEMPTS) {
+      await telemetry.stage('retry');
+      await telemetry.modelRetry(attempt);
+    }
+  }
+
+  throw new ModelOutputError(MAX_OUTPUT_ATTEMPTS);
+}
+
+async function runAgentOnce(input: {
+  agent: Awaited<ReturnType<Mastra['getAgent']>>;
+  prompt: string;
+  requestContext: unknown;
+  threadId: string;
+  telemetry: PlanTelemetry;
+}): Promise<AgentResponse | undefined> {
   const {agent, prompt, requestContext, threadId, telemetry} = input;
+  let streamError: unknown;
 
   const stream = await agent.stream(prompt, {
     requestContext,
@@ -145,14 +204,41 @@ async function runAgentWithTelemetry(input: {
         }
       }
     }
-  } catch {
-    // A stream that ends early must not lose the run; the result is still read.
+  } catch (cause) {
+    // A stream that ends early must not lose the run; the object is still read
+    // below. The cause is kept rather than discarded — swallowing it silently
+    // turned every early end into the same unexplained "no usable response".
+    streamError = cause;
   }
 
-  const result = (await (stream as unknown as {object: Promise<unknown>}).object) as
-    | AgentResponse
-    | undefined;
-  return result;
+  try {
+    return (await (stream as unknown as {object: Promise<unknown>}).object) as
+      | AgentResponse
+      | undefined;
+  } catch (cause) {
+    throw new PlanTripError(agentFailureMessage(cause ?? streamError));
+  }
+}
+
+/**
+ * What to report when the agent produced nothing usable.
+ *
+ * A real cause is passed through rather than replaced. The client classifies
+ * failures from this text — a dropped socket becomes "model unreachable", a
+ * rate limit becomes "rate limited" — so overwriting it with friendlier wording
+ * would make every failure look the same. Secrets are stripped client-side
+ * before any of it is shown.
+ *
+ * Only when there is no cause at all does this supply its own sentence: the
+ * model answered, but not with the object the contract requires.
+ */
+function agentFailureMessage(cause: unknown): string {
+  const text = cause instanceof Error ? cause.message : String(cause ?? '');
+
+  return (
+    text.trim() ||
+    'The planner could not turn that into a plan. Try saying what to change more specifically.'
+  );
 }
 
 /**
@@ -229,31 +315,112 @@ const runTripAgent = createStep({
       });
     }
 
+    /*
+     * A follow-up edits the plan already in the conversation. Conversation
+     * memory alone was not enough: the model had the history and still returned
+     * the same schedule with a reworded summary, because nothing identified the
+     * previous itinerary as the thing being changed. Handing it over as
+     * structured data, with an explicit patch instruction, is what makes the
+     * edit land.
+     */
+    const previous = resourceId
+      ? await latestItinerary({memory: tripMemory, resourceId, threadId: inputData.threadId})
+      : undefined;
+
+    const previousItinerary =
+      previous?.kind === 'itinerary' ? previous.itinerary : undefined;
+
+    const kind = classifyRequest(inputData.message, Boolean(previousItinerary));
+    const modifying = kind === 'follow_up_modification' && previousItinerary;
+
+    const prompt = modifying
+      ? buildFollowUpPrompt(inputData.message, previousItinerary)
+      : inputData.message;
+
     await telemetry.stage('planning');
 
     // requestContext is forwarded explicitly so the agent sees the same
     // authenticated identity the workflow was started with; the thread is the
     // caller's choice and the resource is never passed.
-    let response = await runAgentWithTelemetry({
-      agent,
-      prompt: inputData.message,
-      requestContext,
-      threadId: inputData.threadId,
-      telemetry
-    });
+    /*
+     * Everything the agent does for this turn runs inside a save-intent scope
+     * derived from the user's own words. `save-itinerary` reads it and refuses
+     * when the user did not ask, so an unprompted save is impossible regardless
+     * of what the model decides. Authorization is unchanged and still enforced
+     * inside the tool against the verified Kinde token.
+     */
+    let response = await runWithSaveIntent(inputData.message, () =>
+      runAgentWithTelemetry({
+        agent,
+        prompt,
+        requestContext,
+        threadId: inputData.threadId,
+        telemetry
+      })
+    );
 
     if (!response) {
       await telemetry.runFailed('workflow_failed');
       // Fail loudly rather than inventing a reply. A missing object means the
       // structuring pass could not produce a valid AgentResponse.
       throw new PlanTripError(
-        'The trip agent did not return a usable response. Please try rephrasing the request.'
+        'The planner could not turn that into a plan. Try saying what to change more specifically.'
       );
+    }
+
+    /*
+     * A modification that returns the plan it was given is a failure dressed as
+     * a success. One explicit second attempt is allowed — never a loop — and if
+     * that still comes back unchanged the run reports it rather than telling the
+     * traveller their request was carried out.
+     */
+    if (modifying && response.kind === 'itinerary' && previousItinerary) {
+      const unchanged = materiallyIdentical(previousItinerary, response.itinerary);
+      const missed =
+        !unchanged &&
+        satisfiesRequest(inputData.message, previousItinerary, response.itinerary) ===
+          'unsatisfied';
+
+      if (unchanged || missed) {
+        await telemetry.stage('correction');
+        await telemetry.correctionStarted(1);
+
+        const retry = await runWithSaveIntent(inputData.message, () =>
+          runAgentWithTelemetry({
+            agent,
+            prompt: unchanged
+              ? buildUnchangedPrompt(inputData.message)
+              : buildUnsatisfiedPrompt(inputData.message),
+            requestContext,
+            threadId: inputData.threadId,
+            telemetry
+          })
+        );
+
+        if (retry) response = retry;
+
+        /*
+         * Only a plan that still has not moved at all is an error. A plan that
+         * changed but missed the specific axis is presented anyway: it may be
+         * the best the available activities allow, and the change summary shows
+         * the traveller exactly what did happen so they can judge it.
+         */
+        if (
+          response.kind === 'itinerary' &&
+          materiallyIdentical(previousItinerary, response.itinerary)
+        ) {
+          await telemetry.runFailed('unchanged_itinerary');
+          throw new PlanTripError(
+            'The planner could not change the plan in the way you asked with the activities available. Try naming what to change — a stop to drop, or a time to move.'
+          );
+        }
+      }
     }
 
     // Only a generated plan is validated. A saved-list or a message carries no
     // schedule to check.
     if (response.kind !== 'itinerary') {
+      await persistTurn(resourceId, inputData, response);
       await telemetry.runCompleted();
       return response;
     }
@@ -270,13 +437,17 @@ const runTripAgent = createStep({
         await telemetry.stage('correction');
         await telemetry.correctionStarted(attempt + 1);
 
-        const next = await runAgentWithTelemetry({
-          agent,
-          prompt: buildCorrectionPrompt(validation.issues),
-          requestContext,
-          threadId: inputData.threadId,
-          telemetry
-        });
+        // The same scope as the first pass: intent belongs to what the user
+        // asked for, not to the correction prompt this code wrote.
+        const next = await runWithSaveIntent(inputData.message, () =>
+          runAgentWithTelemetry({
+            agent,
+            prompt: buildCorrectionPrompt(validation.issues),
+            requestContext,
+            threadId: inputData.threadId,
+            telemetry
+          })
+        );
 
         if (!next || next.kind !== 'itinerary') break;
 
@@ -293,10 +464,32 @@ const runTripAgent = createStep({
       throw new ItineraryValidationError(validation.issues);
     }
 
+    await persistTurn(resourceId, inputData, response);
     await telemetry.runCompleted();
     return response;
   }
 });
+
+/**
+ * Keep the validated envelope with the conversation so it can replay as the
+ * same card. Only runs for an owned thread; `recordTurnResponse` re-validates
+ * and never throws.
+ */
+async function persistTurn(
+  resourceId: string | undefined,
+  inputData: {message: string; threadId: string},
+  response: AgentResponse
+): Promise<void> {
+  if (!resourceId) return;
+
+  await recordTurnResponse({
+    memory: tripMemory,
+    resourceId,
+    threadId: inputData.threadId,
+    request: inputData.message,
+    response
+  });
+}
 
 export const planTripWorkflow = createWorkflow({
   id: 'plan-trip',
